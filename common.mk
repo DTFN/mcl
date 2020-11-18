@@ -1,11 +1,13 @@
 GCC_VER=$(shell $(PRE)$(CC) -dumpversion)
 UNAME_S=$(shell uname -s)
+NASM_ELF_OPT=-felf64
 ifeq ($(UNAME_S),Linux)
   OS=Linux
 endif
 ifeq ($(findstring MINGW64,$(UNAME_S)),MINGW64)
   OS=mingw64
   CFLAGS+=-D__USE_MINGW_ANSI_STDIO=1
+  NASM_ELF_OPT=-fwin64
 endif
 ifeq ($(findstring CYGWIN,$(UNAME_S)),CYGWIN)
   OS=cygwin
@@ -20,9 +22,23 @@ ifeq ($(UNAME_S),Darwin)
   GMP_DIR?=/usr/local/opt/gmp
   CFLAGS+=-I$(GMP_DIR)/include
   LDFLAGS+=-L$(GMP_DIR)/lib
+  NASM_ELF_OPT=-fmacho64
 else
   LIB_SUF=so
 endif
+ifeq ($(UNAME_S),OpenBSD)
+  OS=openbsd
+  CXX?=clang++
+  CFLAGS+=-I/usr/local/include
+  LDFLAGS+=-L/usr/local/lib
+endif
+ifeq ($(UNAME_S),FreeBSD)
+  OS=freebsd
+  CXX?=clang++
+  CFLAGS+=-I/usr/local/include
+  LDFLAGS+=-L/usr/local/lib
+endif
+
 ARCH?=$(shell uname -m)
 ifneq ($(findstring $(ARCH),x86_64/amd64),)
   CPU=x86-64
@@ -42,7 +58,7 @@ ifeq ($(ARCH),x86)
   BIT_OPT=-m32
   #LOW_ASM_SRC=src/asm/low_x86.asm
 endif
-ifeq ($(ARCH),armv7l)
+ifneq ($(findstring $(ARCH),armv7l/armv6l),)
   CPU=arm
   BIT=32
   #LOW_ASM_SRC=src/asm/low_arm.s
@@ -51,7 +67,7 @@ ifeq ($(ARCH),aarch64)
   CPU=aarch64
   BIT=64
 endif
-ifeq ($(findstring $(OS),mac/mingw64),)
+ifeq ($(findstring $(OS),mac/mingw64/openbsd),)
   LDFLAGS+=-lrt
 endif
 
@@ -66,7 +82,7 @@ ifeq ($(DEBUG),1)
     LDFLAGS+=-fsanitize=address
   endif
 else
-  CFLAGS_OPT+=-fomit-frame-pointer -DNDEBUG
+  CFLAGS_OPT+=-fomit-frame-pointer -DNDEBUG -fno-stack-protector
   ifeq ($(CXX),clang++)
     CFLAGS_OPT+=-O3
   else
@@ -84,7 +100,7 @@ else
     CFLAGS_OPT+=$(MARCH)
   endif
 endif
-CFLAGS_WARN=-Wall -Wextra -Wformat=2 -Wcast-qual -Wcast-align -Wwrite-strings -Wfloat-equal -Wpointer-arith
+CFLAGS_WARN=-Wall -Wextra -Wformat=2 -Wcast-qual -Wcast-align -Wwrite-strings -Wfloat-equal -Wpointer-arith -Wundef
 CFLAGS+=-g3
 INC_OPT=-I include -I test
 CFLAGS+=$(CFLAGS_WARN) $(BIT_OPT) $(INC_OPT)
@@ -95,7 +111,13 @@ CFLAGS+=$(CFLAGS_OPT_USER)
 endif
 CFLAGS+=$(CFLAGS_USER)
 MCL_USE_GMP?=1
-MCL_USE_OPENSSL?=1
+ifeq ($(OS),mac)
+  ifeq ($(shell sw_vers -productVersion),10.15)
+    # workaround because of GMP does not run well on Catalina
+    MCL_USE_GMP=0
+  endif
+endif
+MCL_USE_OPENSSL?=0
 ifeq ($(MCL_USE_GMP),0)
   CFLAGS+=-DMCL_USE_VINT
 endif
@@ -110,6 +132,11 @@ ifeq ($(MCL_USE_GMP),1)
 endif
 ifeq ($(MCL_USE_OPENSSL),1)
   OPENSSL_LIB=-lcrypto
+endif
+ifeq ($(MCL_STATIC_CODE),1)
+  MCL_USE_XBYAK=0
+  MCL_MAX_BIT_SIZE=384
+  CFLAGS+=-DMCL_STATIC_CODE
 endif
 LDFLAGS+=$(GMP_LIB) $(OPENSSL_LIB) $(BIT_OPT) $(LDFLAGS_USER)
 

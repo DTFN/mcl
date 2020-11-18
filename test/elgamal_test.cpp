@@ -1,10 +1,5 @@
 #include <cybozu/test.hpp>
 #include <cybozu/random_generator.hpp>
-#ifdef MCL_DONT_USE_OPENSSL
-#include <cybozu/sha1.hpp>
-#else
-#include <cybozu/crypto.hpp>
-#endif
 #include <mcl/fp.hpp>
 #include <mcl/ecparam.hpp>
 #include <mcl/elgamal.hpp>
@@ -16,30 +11,26 @@ typedef mcl::EcT<Fp> Ec;
 typedef mcl::ElgamalT<Ec, Zn> ElgamalEc;
 
 const mcl::EcParam& para = mcl::ecparam::secp192k1;
-cybozu::RandomGenerator rg;
+cybozu::RandomGenerator g_rg;
 
 CYBOZU_TEST_AUTO(testEc)
 {
-	Fp::init(para.p);
-	Zn::init(para.n);
-	Ec::init(para.a, para.b);
-	const Fp x0(para.gx);
-	const Fp y0(para.gy);
+	Ec P;
+	mcl::initCurve<Ec, Zn>(para.curveType, &P);
 	const size_t bitSize = Zn::getBitSize();
-	const Ec P(x0, y0);
 	/*
 		Zn = <P>
 	*/
 	ElgamalEc::PrivateKey prv;
-	prv.init(P, bitSize, rg);
+	prv.init(P, bitSize, g_rg);
 	prv.setCache(0, 60000);
 	const ElgamalEc::PublicKey& pub = prv.getPublicKey();
 
 	const int m1 = 12345;
 	const int m2 = 17655;
 	ElgamalEc::CipherText c1, c2;
-	pub.enc(c1, m1, rg);
-	pub.enc(c2, m2, rg);
+	pub.enc(c1, m1, g_rg);
+	pub.enc(c2, m2, g_rg);
 	Zn dec1, dec2;
 	prv.dec(dec1, c1);
 	prv.dec(dec2, c2);
@@ -74,7 +65,7 @@ CYBOZU_TEST_AUTO(testEc)
 			ss << pub;
 			ss >> pub2;
 		}
-		pub2.enc(cc2, m2, rg);
+		pub2.enc(cc2, m2, g_rg);
 		prv.dec(d, cc2);
 		CYBOZU_TEST_EQUAL(d, m2);
 	}
@@ -91,7 +82,7 @@ CYBOZU_TEST_AUTO(testEc)
 	}
 	// rerandomize
 	c1 = c2;
-	pub.rerandomize(c1, rg);
+	pub.rerandomize(c1, g_rg);
 	// verify c1 != c2
 	CYBOZU_TEST_ASSERT(c1.c1 != c2.c1);
 	CYBOZU_TEST_ASSERT(c1.c2 != c2.c2);
@@ -103,7 +94,7 @@ CYBOZU_TEST_AUTO(testEc)
 	{
 		ElgamalEc::CipherText c;
 		Zn m = 1234;
-		pub.enc(c, m, rg);
+		pub.enc(c, m, g_rg);
 		c.neg();
 		Zn dec;
 		prv.dec(dec, c);
@@ -114,7 +105,7 @@ CYBOZU_TEST_AUTO(testEc)
 		ElgamalEc::CipherText c;
 		Zn m = 123;
 		int x = 111;
-		pub.enc(c, m, rg);
+		pub.enc(c, m, g_rg);
 		Zn dec;
 		prv.dec(dec, c);
 		c.mul(x);
@@ -127,7 +118,7 @@ CYBOZU_TEST_AUTO(testEc)
 	for (int i = -10; i < 10; i++) {
 		ElgamalEc::CipherText c;
 		const Zn mm = i;
-		pub.enc(c, mm, rg);
+		pub.enc(c, mm, g_rg);
 		Zn dec;
 		prv.dec(dec, c, 1000);
 		CYBOZU_TEST_EQUAL(dec, mm);
@@ -136,7 +127,7 @@ CYBOZU_TEST_AUTO(testEc)
 	// isZeroMessage
 	for (int m = 0; m < 10; m++) {
 		ElgamalEc::CipherText c0;
-		pub.enc(c0, m, rg);
+		pub.enc(c0, m, g_rg);
 		if (m == 0) {
 			CYBOZU_TEST_ASSERT(prv.isZeroMessage(c0));
 		} else {
@@ -147,19 +138,14 @@ CYBOZU_TEST_AUTO(testEc)
 	{
 		ElgamalEc::Zkp zkp;
 		ElgamalEc::CipherText c;
-#ifdef MCL_DONT_USE_OPENSSL
-		cybozu::Sha1 hash;
-#else
-		cybozu::crypto::Hash hash(cybozu::crypto::Hash::N_SHA256);
-#endif
-		pub.encWithZkp(c, zkp, 0, hash, rg);
-		CYBOZU_TEST_ASSERT(pub.verify(c, zkp, hash));
-		zkp.s0 += 1;
-		CYBOZU_TEST_ASSERT(!pub.verify(c, zkp, hash));
-		pub.encWithZkp(c, zkp, 1, hash, rg);
-		CYBOZU_TEST_ASSERT(pub.verify(c, zkp, hash));
-		zkp.s0 += 1;
-		CYBOZU_TEST_ASSERT(!pub.verify(c, zkp, hash));
-		CYBOZU_TEST_EXCEPTION_MESSAGE(pub.encWithZkp(c, zkp, 2, hash, rg), cybozu::Exception, "encWithZkp");
+		pub.encWithZkp(c, zkp, 0, g_rg);
+		CYBOZU_TEST_ASSERT(pub.verify(c, zkp));
+		zkp.s[0] += 1;
+		CYBOZU_TEST_ASSERT(!pub.verify(c, zkp));
+		pub.encWithZkp(c, zkp, 1, g_rg);
+		CYBOZU_TEST_ASSERT(pub.verify(c, zkp));
+		zkp.s[0] += 1;
+		CYBOZU_TEST_ASSERT(!pub.verify(c, zkp));
+		CYBOZU_TEST_EXCEPTION_MESSAGE(pub.encWithZkp(c, zkp, 2, g_rg), cybozu::Exception, "encWithZkp");
 	}
 }

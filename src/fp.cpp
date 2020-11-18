@@ -1,15 +1,29 @@
 #include <mcl/op.hpp>
 #include <mcl/util.hpp>
-#ifdef MCL_DONT_USE_OPENSSL
 #include <cybozu/sha2.hpp>
-#else
-#include <cybozu/crypto.hpp>
-#endif
 #include <cybozu/endian.hpp>
 #include <mcl/conversion.hpp>
+
+#if defined(MCL_STATIC_CODE) || defined(MCL_USE_XBYAK) || defined(MCL_USE_LLVM)
+
+#ifdef MCL_USE_XBYAK
+	#define XBYAK_DISABLE_AVX512
+#else
+	#define XBYAK_ONLY_CLASS_CPU
+#endif
+
+#include "xbyak/xbyak_util.h"
+Xbyak::util::Cpu g_cpu;
+
+#ifdef MCL_STATIC_CODE
+#include "fp_static_code.hpp"
+#endif
 #ifdef MCL_USE_XBYAK
 #include "fp_generator.hpp"
 #endif
+
+#endif
+
 #include "low_func.hpp"
 #ifdef MCL_USE_LLVM
 #include "proto.hpp"
@@ -120,43 +134,57 @@ bool isEnableJIT()
 #endif
 }
 
-void getRandVal(bool *pb, void *p, RandGen& rg, const Unit *in, size_t bitSize)
-{
-	if (rg.isZero()) rg = RandGen::get();
-	Unit *out = reinterpret_cast<Unit*>(p);
-	const size_t n = (bitSize + UnitBitSize - 1) / UnitBitSize;
-	const size_t rem = bitSize & (UnitBitSize - 1);
-	assert(n > 0);
-	for (;;) {
-		rg.read(pb, out, n * sizeof(Unit)); // byte size
-		if (!*pb) return;
-		if (rem > 0) out[n - 1] &= (Unit(1) << rem) - 1;
-		if (isLessArray(out, in, n)) return;
-	}
-}
-
 uint32_t sha256(void *out, uint32_t maxOutSize, const void *msg, uint32_t msgSize)
 {
-	const uint32_t hashSize = 256 / 8;
-	if (maxOutSize < hashSize) return 0;
-#ifdef MCL_DONT_USE_OPENSSL
-	cybozu::Sha256(msg, msgSize).get(out);
-#else
-	cybozu::crypto::Hash::digest(out, cybozu::crypto::Hash::N_SHA256, msg, msgSize);
-#endif
-	return hashSize;
+	return (uint32_t)cybozu::Sha256().digest(out, maxOutSize, msg, msgSize);
 }
 
 uint32_t sha512(void *out, uint32_t maxOutSize, const void *msg, uint32_t msgSize)
 {
-	const uint32_t hashSize = 512 / 8;
-	if (maxOutSize < hashSize) return 0;
-#ifdef MCL_DONT_USE_OPENSSL
-	cybozu::Sha512(msg, msgSize).get(out);
-#else
-	cybozu::crypto::Hash::digest(out, cybozu::crypto::Hash::N_SHA512, msg, msgSize);
-#endif
-	return hashSize;
+	return (uint32_t)cybozu::Sha512().digest(out, maxOutSize, msg, msgSize);
+}
+
+void expand_message_xmd(uint8_t out[], size_t outSize, const void *msg, size_t msgSize, const void *dst, size_t dstSize)
+{
+	const size_t mdSize = 32;
+	assert((outSize % mdSize) == 0 && 0 < outSize && outSize <= 256);
+	const size_t r_in_bytes = 64;
+	const size_t n = outSize / mdSize;
+	static const uint8_t Z_pad[r_in_bytes] = {};
+	assert(dstSize < 256);
+	/*
+		Z_apd | msg | BE(outSize, 2) | BE(0, 1) | DST | BE(dstSize, 1)
+	*/
+	uint8_t lenBuf[2];
+	uint8_t iBuf = 0;
+	uint8_t dstSizeBuf = uint8_t(dstSize);
+	cybozu::Set16bitAsBE(lenBuf, uint16_t(outSize));
+	cybozu::Sha256 h;
+	h.update(Z_pad, r_in_bytes);
+	h.update(msg, msgSize);
+	h.update(lenBuf, sizeof(lenBuf));
+	h.update(&iBuf, 1);
+	h.update(dst, dstSize);
+	uint8_t md[mdSize];
+	h.digest(md, mdSize, &dstSizeBuf, 1);
+	h.clear();
+	h.update(md, mdSize);
+	iBuf = 1;
+	h.update(&iBuf, 1);
+	h.update(dst, dstSize);
+	h.digest(out, mdSize, &dstSizeBuf, 1);
+	uint8_t mdXor[mdSize];
+	for (size_t i = 1; i < n; i++) {
+		h.clear();
+		for (size_t j = 0; j < mdSize; j++) {
+			mdXor[j] = md[j] ^ out[mdSize * (i - 1) + j];
+		}
+		h.update(mdXor, mdSize);
+		iBuf = uint8_t(i + 1);
+		h.update(&iBuf, 1);
+		h.update(dst, dstSize);
+		h.digest(out + mdSize * i, mdSize, &dstSizeBuf, 1);
+	}
 }
 
 
@@ -285,15 +313,14 @@ void setOp(Op& op, Mode mode)
 	setOp2<N, Gtag, true, false>(op);
 #ifdef MCL_USE_LLVM
 	if (mode != fp::FP_GMP && mode != fp::FP_GMP_MONT) {
-#if defined(MCL_USE_XBYAK) && CYBOZU_HOST == CYBOZU_HOST_INTEL
+#if MCL_LLVM_BMI2 == 1
 		const bool gmpIsFasterThanLLVM = false;//(N == 8 && MCL_SIZEOF_UNIT == 8);
-		Xbyak::util::Cpu cpu;
-		if (cpu.has(Xbyak::util::Cpu::tBMI2)) {
-			setOp2<N, LBMI2tag, (N * UnitBitSize <= 256), gmpIsFasterThanLLVM>(op);
+		if (g_cpu.has(Xbyak::util::Cpu::tBMI2)) {
+			setOp2<N, LBMI2tag, (N * UnitBitSize <= 384), gmpIsFasterThanLLVM>(op);
 		} else
 #endif
 		{
-			setOp2<N, Ltag, (N * UnitBitSize <= 256), false>(op);
+			setOp2<N, Ltag, (N * UnitBitSize <= 384), false>(op);
 		}
 	}
 #else
@@ -301,7 +328,7 @@ void setOp(Op& op, Mode mode)
 #endif
 }
 
-#ifdef MCL_USE_XBYAK
+#ifdef MCL_X64_ASM
 inline void invOpForMontC(Unit *y, const Unit *x, const Op& op)
 {
 	Unit r[maxUnitSize];
@@ -349,20 +376,38 @@ static bool initForMont(Op& op, const Unit *p, Mode mode)
 		if (!b) return false;
 	}
 	op.rp = getMontgomeryCoeff(p[0]);
-	if (mode != FP_XBYAK) return true;
-#ifdef MCL_USE_XBYAK
-	if (op.fg == 0) op.fg = Op::createFpGenerator();
-	op.fg->init(op);
 
-	if (op.isMont && N <= 4) {
+	(void)mode;
+#ifdef MCL_X64_ASM
+
+#ifdef MCL_USE_XBYAK
+#ifndef MCL_DUMP_JIT
+	if (mode != FP_XBYAK) return true;
+#endif
+	if (op.fg == 0) op.fg = Op::createFpGenerator();
+	bool enableInv = op.fg->init(op, g_cpu);
+#ifdef MCL_DUMP_JIT
+	return true;
+#endif
+#elif defined(MCL_STATIC_CODE)
+	fp::setStaticCode(op);
+	bool enableInv = true;
+#endif // MCL_USE_XBYAK
+
+#ifdef MCL_USE_VINT
+	const int maxInvN = 6;
+#else
+	const int maxInvN = 4;
+#endif
+	if (enableInv && op.isMont && N <= maxInvN) {
 		op.fp_invOp = &invOpForMontC;
 		initInvTbl(op);
 	}
-#endif
+#endif // MCL_X64_ASM
 	return true;
 }
 
-bool Op::init(const mpz_class& _p, size_t maxBitSize, Mode mode, size_t mclMaxBitSize)
+bool Op::init(const mpz_class& _p, size_t maxBitSize, int _xi_a, Mode mode, size_t mclMaxBitSize)
 {
 	if (mclMaxBitSize != MCL_MAX_BIT_SIZE) return false;
 #ifdef MCL_USE_VINT
@@ -384,18 +429,29 @@ bool Op::init(const mpz_class& _p, size_t maxBitSize, Mode mode, size_t mclMaxBi
 	mp = _p;
 	bitSize = gmp::getBitSize(mp);
 	pmod4 = gmp::getUnit(mp, 0) % 4;
+	this->xi_a = _xi_a;
 /*
 	priority : MCL_USE_XBYAK > MCL_USE_LLVM > none
 	Xbyak > llvm_mont > llvm > gmp_mont > gmp
 */
-#ifdef MCL_USE_XBYAK
+#ifdef MCL_X64_ASM
 	if (mode == FP_AUTO) mode = FP_XBYAK;
 	if (mode == FP_XBYAK && bitSize > 384) {
 		mode = FP_AUTO;
 	}
+#ifdef MCL_USE_XBYAK
 	if (!isEnableJIT()) {
 		mode = FP_AUTO;
 	}
+#elif defined(MCL_STATIC_CODE)
+	{
+		// static jit code uses avx, mulx, adox, adcx
+		using namespace Xbyak::util;
+		if (!(g_cpu.has(Cpu::tAVX) && g_cpu.has(Cpu::tBMI2) && g_cpu.has(Cpu::tADX))) {
+			mode = FP_AUTO;
+		}
+	}
+#endif
 #else
 	if (mode == FP_XBYAK) mode = FP_AUTO;
 #endif
@@ -419,21 +475,30 @@ bool Op::init(const mpz_class& _p, size_t maxBitSize, Mode mode, size_t mclMaxBi
 	isFullBit = (bitSize % UnitBitSize) == 0;
 
 #if defined(MCL_USE_LLVM) || defined(MCL_USE_XBYAK)
-	if ((mode == FP_AUTO || mode == FP_LLVM || mode == FP_XBYAK)
-		&& mp == mpz_class("0xfffffffffffffffffffffffffffffffeffffffffffffffff")) {
-		primeMode = PM_NIST_P192;
-		isMont = false;
-		isFastMod = true;
-	}
-	if ((mode == FP_AUTO || mode == FP_LLVM || mode == FP_XBYAK)
-		&& mp == mpz_class("0x1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")) {
-		primeMode = PM_NIST_P521;
-		isMont = false;
-		isFastMod = true;
+	if (mode == FP_AUTO || mode == FP_LLVM || mode == FP_XBYAK) {
+		const struct {
+			PrimeMode mode;
+			const char *str;
+		} tbl[] = {
+			{ PM_NIST_P192, "0xfffffffffffffffffffffffffffffffeffffffffffffffff" },
+			{ PM_NIST_P521, "0x1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" },
+		};
+		// use fastMode for special primes
+		for (size_t i = 0; i < CYBOZU_NUM_OF_ARRAY(tbl); i++) {
+			bool b;
+			mpz_class target;
+			gmp::setStr(&b, target, tbl[i].str);
+			if (b && mp == target) {
+				primeMode = tbl[i].mode;
+				isMont = false;
+				isFastMod = true;
+				break;
+			}
+		}
 	}
 #endif
 #if defined(MCL_USE_VINT) && MCL_SIZEOF_UNIT == 8
-	{
+	if (mode != FP_LLVM && mode != FP_XBYAK) {
 		const char *secp256k1Str = "0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f";
 		bool b;
 		mpz_class secp256k1;
@@ -509,6 +574,7 @@ bool Op::init(const mpz_class& _p, size_t maxBitSize, Mode mode, size_t mclMaxBi
 		sq.set(&b, mp);
 		if (!b) return false;
 	}
+	modp.init(mp);
 	return fp::initForMont(*this, p, mode);
 }
 
@@ -561,6 +627,27 @@ int detectIoMode(int ioMode, const std::ios_base& ios)
 bool copyAndMask(Unit *y, const void *x, size_t xByteSize, const Op& op, MaskMode maskMode)
 {
 	const size_t fpByteSize = sizeof(Unit) * op.N;
+	if (maskMode == Mod) {
+		if (xByteSize > fpByteSize * 2) return false;
+		mpz_class mx;
+		bool b;
+		gmp::setArray(&b, mx, (const char*)x, xByteSize);
+		if (!b) return false;
+#ifdef MCL_USE_VINT
+		op.modp.modp(mx, mx);
+#else
+		mx %= op.mp;
+#endif
+		const Unit *pmx = gmp::getUnit(mx);
+		size_t i = 0;
+		for (const size_t n = gmp::getUnitSize(mx); i < n; i++) {
+			y[i] = pmx[i];
+		}
+		for (; i < op.N; i++) {
+			y[i] = 0;
+		}
+		return true;
+	}
 	if (xByteSize > fpByteSize) {
 		if (maskMode == NoMask) return false;
 		xByteSize = fpByteSize;
@@ -652,11 +739,6 @@ int64_t getInt64(bool *pb, fp::Block& b, const fp::Op& op)
 #ifdef _MSC_VER
 	#pragma warning(pop)
 #endif
-
-void Op::initFp2(int _xi_a)
-{
-	this->xi_a = _xi_a;
-}
 
 } } // mcl::fp
 

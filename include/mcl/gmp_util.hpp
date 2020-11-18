@@ -10,7 +10,10 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <stdint.h>
+#include <cybozu/bit_operation.hpp>
+#ifndef CYBOZU_DONT_USE_EXCEPTION
 #include <cybozu/exception.hpp>
+#endif
 #include <mcl/randgen.hpp>
 #ifdef _MSC_VER
 	#pragma warning(push)
@@ -23,6 +26,9 @@
 #endif
 #if defined(__EMSCRIPTEN__) || defined(__wasm__)
 	#define MCL_USE_VINT
+#endif
+#ifndef MCL_MAX_BIT_SIZE
+	#define MCL_MAX_BIT_SIZE 521
 #endif
 #ifdef MCL_USE_VINT
 #include <mcl/vint.hpp>
@@ -91,7 +97,7 @@ template<class T>
 void getArray(bool *pb, T *buf, size_t maxSize, const mpz_class& x)
 {
 #ifdef MCL_USE_VINT
-	*pb = getArray_(buf, maxSize, x.getUnit(), x.getUnitSize());
+	*pb = getArray_(buf, maxSize, x.getUnit(), (int)x.getUnitSize());
 #else
 	*pb = getArray_(buf, maxSize, x.get_mpz_t()->_mp_d, x.get_mpz_t()->_mp_size);
 #endif
@@ -429,6 +435,36 @@ inline size_t getUnitSize(const mpz_class& x)
 	return std::abs(x.get_mpz_t()->_mp_size);
 #endif
 }
+
+/*
+	get the number of lower zeros
+*/
+template<class T>
+size_t getLowerZeroBitNum(const T *x, size_t n)
+{
+	size_t ret = 0;
+	for (size_t i = 0; i < n; i++) {
+		T v = x[i];
+		if (v == 0) {
+			ret += sizeof(T) * 8;
+		} else {
+			ret += cybozu::bsf<T>(v);
+			break;
+		}
+	}
+	return ret;
+}
+
+/*
+	get the number of lower zero
+	@note x != 0
+*/
+inline size_t getLowerZeroBitNum(const mpz_class& x)
+{
+	assert(!isZero(x));
+	return getLowerZeroBitNum(getUnit(x), getUnitSize(x));
+}
+
 inline mpz_class abs(const mpz_class& x)
 {
 #ifdef MCL_USE_VINT
@@ -568,6 +604,53 @@ bool getNAF(Vec& v, const mpz_class& x)
 	} else {
 		v.swap(bin);
 		return false;
+	}
+}
+
+/*
+	v = naf[i]
+	v = 0 or (|v| <= 2^(w-1) - 1 and odd)
+*/
+template<class Vec>
+void getNAFwidth(bool *pb, Vec& naf, mpz_class x, size_t w)
+{
+	assert(w > 0);
+	*pb = true;
+	naf.clear();
+	bool negative = false;
+	if (x < 0) {
+		negative = true;
+		x = -x;
+	}
+	size_t zeroNum = 0;
+	const int signedMaxW = 1 << (w - 1);
+	const int maxW = signedMaxW * 2;
+	const int maskW = maxW - 1;
+	while (!isZero(x)) {
+		size_t z = gmp::getLowerZeroBitNum(x);
+		if (z) {
+			x >>= z;
+			zeroNum += z;
+		}
+		for (size_t i = 0; i < zeroNum; i++) {
+			naf.push(pb, 0);
+			if (!*pb) return;
+		}
+		assert(!isZero(x));
+		int v = getUnit(x)[0] & maskW;
+		x >>= w;
+		if (v & signedMaxW) {
+			x++;
+			v -= maxW;
+		}
+		naf.push(pb, typename Vec::value_type(v));
+		if (!*pb) return;
+		zeroNum = w - 1;
+	}
+	if (negative) {
+		for (size_t i = 0; i < naf.size(); i++) {
+			naf[i] = -naf[i];
+		}
 	}
 }
 
@@ -857,6 +940,98 @@ public:
 		if (!b) throw cybozu::Exception("gmp:SquareRoot:set");
 	}
 #endif
+};
+
+/*
+	Barrett Reduction
+	for non GMP version
+	mod of GMP is faster than Modp
+*/
+struct Modp {
+	static const size_t unitBitSize = sizeof(mcl::fp::Unit) * 8;
+	mpz_class p_;
+	mpz_class u_;
+	mpz_class a_;
+	size_t pBitSize_;
+	size_t N_;
+	bool initU_; // Is u_ initialized?
+	Modp()
+		: pBitSize_(0)
+		, N_(0)
+		, initU_(false)
+	{
+	}
+	// x &= 1 << (unitBitSize * unitSize)
+	void shrinkSize(mpz_class &x, size_t unitSize) const
+	{
+		size_t u = gmp::getUnitSize(x);
+		if (u < unitSize) return;
+		bool b;
+		gmp::setArray(&b, x, gmp::getUnit(x), unitSize);
+		(void)b;
+		assert(b);
+	}
+	// p_ is set by p and compute (u_, a_) if possible
+	void init(const mpz_class& p)
+	{
+		p_ = p;
+		pBitSize_ = gmp::getBitSize(p);
+		N_ = (pBitSize_ + unitBitSize - 1) / unitBitSize;
+		initU_ = false;
+#if 0
+		u_ = (mpz_class(1) << (unitBitSize * 2 * N_)) / p_;
+#else
+		/*
+			1 << (unitBitSize * 2 * N_) may be overflow,
+			so use (1 << (unitBitSize * 2 * N_)) - 1 because u_ is same.
+		*/
+		uint8_t buf[48 * 2];
+		const size_t byteSize = unitBitSize / 8 * 2 * N_;
+		if (byteSize > sizeof(buf)) return;
+		memset(buf, 0xff, byteSize);
+		bool b;
+		gmp::setArray(&b, u_, buf, byteSize);
+		if (!b) return;
+#endif
+		u_ /= p_;
+		a_ = mpz_class(1) << (unitBitSize * (N_ + 1));
+		initU_ = true;
+	}
+	void modp(mpz_class& r, const mpz_class& t) const
+	{
+		assert(p_ > 0);
+		const size_t tBitSize = gmp::getBitSize(t);
+		// use gmp::mod if init() fails or t is too large
+		if (tBitSize > unitBitSize * 2 * N_ || !initU_) {
+			gmp::mod(r, t, p_);
+			return;
+		}
+		if (tBitSize < pBitSize_) {
+			r = t;
+			return;
+		}
+		// mod is faster than modp if t is small
+		if (tBitSize <= unitBitSize * N_) {
+			gmp::mod(r, t, p_);
+			return;
+		}
+		mpz_class q;
+		q = t;
+		q >>= unitBitSize * (N_ - 1);
+		q *= u_;
+		q >>= unitBitSize * (N_ + 1);
+		q *= p_;
+		shrinkSize(q, N_ + 1);
+		r = t;
+		shrinkSize(r, N_ + 1);
+		r -= q;
+		if (r < 0) {
+			r += a_;
+		}
+		if (r >= p_) {
+			r -= p_;
+		}
+	}
 };
 
 } // mcl

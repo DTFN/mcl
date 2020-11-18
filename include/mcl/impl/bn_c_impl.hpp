@@ -1,3 +1,7 @@
+/*
+	This is an internal header
+	Do not include this
+*/
 #define MCLBN_DLL_EXPORT
 #include <mcl/bn.h>
 
@@ -13,6 +17,7 @@
 	#error "not supported size"
 #endif
 #include <mcl/lagrange.hpp>
+#include <mcl/ecparam.hpp>
 using namespace mcl::bn;
 
 static Fr *cast(mclBnFr *p) { return reinterpret_cast<Fr*>(p); }
@@ -29,6 +34,12 @@ static const Fp12 *cast(const mclBnGT *p) { return reinterpret_cast<const Fp12*>
 
 static Fp6 *cast(uint64_t *p) { return reinterpret_cast<Fp6*>(p); }
 static const Fp6 *cast(const uint64_t *p) { return reinterpret_cast<const Fp6*>(p); }
+
+static Fp2 *cast(mclBnFp2 *p) { return reinterpret_cast<Fp2*>(p); }
+static const Fp2 *cast(const mclBnFp2 *p) { return reinterpret_cast<const Fp2*>(p); }
+
+static Fp *cast(mclBnFp *p) { return reinterpret_cast<Fp*>(p); }
+static const Fp *cast(const mclBnFp *p) { return reinterpret_cast<const Fp*>(p); }
 
 template<class T>
 int setStr(T *x, const char *buf, mclSize bufSize, int ioMode)
@@ -49,15 +60,33 @@ extern "C" MCLBN_DLL_API void mclBnFree(void *p)
 }
 #endif
 
+int mclBn_getVersion()
+{
+	return mcl::version;
+}
+
 int mclBn_init(int curve, int compiledTimeVar)
 {
 	if (compiledTimeVar != MCLBN_COMPILED_TIME_VAR) {
 		return -(compiledTimeVar | (MCLBN_COMPILED_TIME_VAR * 100));
 	}
-	const mcl::CurveParam& cp = mcl::getCurveParam(curve);
+	if (MCL_EC_BEGIN <= curve && curve < MCL_EC_END) {
+		const mcl::EcParam *para = mcl::getEcParam(curve);
+		if (para == 0) return -2;
+		bool b;
+		initG1only(&b, *para);
+		return b ? 0 : -1;
+	}
+	const mcl::CurveParam* cp = mcl::getCurveParam(curve);
+	if (cp == 0) return -1;
 	bool b;
-	initPairing(&b, cp);
+	initPairing(&b, *cp);
 	return b ? 0 : -1;
+}
+
+int mclBn_getCurveType()
+{
+	return mcl::bn::BN::param.cp.curveType;
 }
 
 int mclBn_getOpUnitSize()
@@ -67,12 +96,17 @@ int mclBn_getOpUnitSize()
 
 int mclBn_getG1ByteSize()
 {
-	return (int)Fp::getByteSize();
+	return mclBn_getFpByteSize();
 }
 
 int mclBn_getFrByteSize()
 {
 	return (int)Fr::getByteSize();
+}
+
+int mclBn_getFpByteSize()
+{
+	return (int)Fp::getByteSize();
 }
 
 mclSize mclBn_getCurveOrder(char *buf, mclSize maxBufSize)
@@ -83,6 +117,23 @@ mclSize mclBn_getCurveOrder(char *buf, mclSize maxBufSize)
 mclSize mclBn_getFieldOrder(char *buf, mclSize maxBufSize)
 {
 	return Fp::getModulo(buf, maxBufSize);
+}
+
+void mclBn_setETHserialization(int enable)
+{
+	if (mclBn_getCurveType() != MCL_BLS12_381) return;
+	Fp::setETHserialization(enable == 1);
+	Fr::setETHserialization(enable == 1);
+}
+
+int mclBn_getETHserialization()
+{
+	return Fp::getETHserialization() ? 1 : 0;
+}
+
+int mclBn_setMapToMode(int mode)
+{
+	return setMapToMode(mode) ? 0 : -1;
 }
 
 ////////////////////////////////////////////////
@@ -111,6 +162,23 @@ int mclBnFr_setLittleEndian(mclBnFr *x, const void *buf, mclSize bufSize)
 	cast(x)->setArrayMask((const char *)buf, bufSize);
 	return 0;
 }
+int mclBnFr_setBigEndianMod(mclBnFr *x, const void *buf, mclSize bufSize)
+{
+	bool b;
+	cast(x)->setBigEndianMod(&b, buf, bufSize);
+	return b ? 0 : -1;
+}
+
+mclSize mclBnFr_getLittleEndian(void *buf, mclSize maxBufSize, const mclBnFr *x)
+{
+	return cast(x)->getLittleEndian(buf, maxBufSize);
+}
+int mclBnFr_setLittleEndianMod(mclBnFr *x, const void *buf, mclSize bufSize)
+{
+	bool b;
+	cast(x)->setArray(&b, (const char *)buf, bufSize, mcl::fp::Mod);
+	return b ? 0 : -1;
+}
 mclSize mclBnFr_deserialize(mclBnFr *x, const void *buf, mclSize bufSize)
 {
 	return (mclSize)cast(x)->deserialize(buf, bufSize);
@@ -132,9 +200,23 @@ int mclBnFr_isOne(const mclBnFr *x)
 {
 	return cast(x)->isOne();
 }
+int mclBnFr_isOdd(const mclBnFr *x)
+{
+	return cast(x)->isOdd();
+}
+int mclBnFr_isNegative(const mclBnFr *x)
+{
+	return cast(x)->isNegative();
+}
 
 #ifndef MCL_DONT_USE_CSRPNG
 int mclBnFr_setByCSPRNG(mclBnFr *x)
+{
+	bool b;
+	cast(x)->setByCSPRNG(&b);
+	return b ? 0 : -1;
+}
+int mclBnFp_setByCSPRNG(mclBnFp *x)
 {
 	bool b;
 	cast(x)->setByCSPRNG(&b);
@@ -189,6 +271,77 @@ void mclBnFr_mul(mclBnFr *z, const mclBnFr *x, const mclBnFr *y)
 void mclBnFr_div(mclBnFr *z, const mclBnFr *x, const mclBnFr *y)
 {
 	Fr::div(*cast(z),*cast(x), *cast(y));
+}
+
+void mclBnFp_neg(mclBnFp *y, const mclBnFp *x)
+{
+	Fp::neg(*cast(y), *cast(x));
+}
+void mclBnFp_inv(mclBnFp *y, const mclBnFp *x)
+{
+	Fp::inv(*cast(y), *cast(x));
+}
+void mclBnFp_sqr(mclBnFp *y, const mclBnFp *x)
+{
+	Fp::sqr(*cast(y), *cast(x));
+}
+void mclBnFp_add(mclBnFp *z, const mclBnFp *x, const mclBnFp *y)
+{
+	Fp::add(*cast(z),*cast(x), *cast(y));
+}
+void mclBnFp_sub(mclBnFp *z, const mclBnFp *x, const mclBnFp *y)
+{
+	Fp::sub(*cast(z),*cast(x), *cast(y));
+}
+void mclBnFp_mul(mclBnFp *z, const mclBnFp *x, const mclBnFp *y)
+{
+	Fp::mul(*cast(z),*cast(x), *cast(y));
+}
+void mclBnFp_div(mclBnFp *z, const mclBnFp *x, const mclBnFp *y)
+{
+	Fp::div(*cast(z),*cast(x), *cast(y));
+}
+
+void mclBnFp2_neg(mclBnFp2 *y, const mclBnFp2 *x)
+{
+	Fp2::neg(*cast(y), *cast(x));
+}
+void mclBnFp2_inv(mclBnFp2 *y, const mclBnFp2 *x)
+{
+	Fp2::inv(*cast(y), *cast(x));
+}
+void mclBnFp2_sqr(mclBnFp2 *y, const mclBnFp2 *x)
+{
+	Fp2::sqr(*cast(y), *cast(x));
+}
+void mclBnFp2_add(mclBnFp2 *z, const mclBnFp2 *x, const mclBnFp2 *y)
+{
+	Fp2::add(*cast(z),*cast(x), *cast(y));
+}
+void mclBnFp2_sub(mclBnFp2 *z, const mclBnFp2 *x, const mclBnFp2 *y)
+{
+	Fp2::sub(*cast(z),*cast(x), *cast(y));
+}
+void mclBnFp2_mul(mclBnFp2 *z, const mclBnFp2 *x, const mclBnFp2 *y)
+{
+	Fp2::mul(*cast(z),*cast(x), *cast(y));
+}
+void mclBnFp2_div(mclBnFp2 *z, const mclBnFp2 *x, const mclBnFp2 *y)
+{
+	Fp2::div(*cast(z),*cast(x), *cast(y));
+}
+
+int mclBnFr_squareRoot(mclBnFr *y, const mclBnFr *x)
+{
+	return Fr::squareRoot(*cast(y), *cast(x)) ? 0 : -1;
+}
+int mclBnFp_squareRoot(mclBnFp *y, const mclBnFp *x)
+{
+	return Fp::squareRoot(*cast(y), *cast(x)) ? 0 : -1;
+}
+int mclBnFp2_squareRoot(mclBnFp2 *y, const mclBnFp2 *x)
+{
+	return Fp2::squareRoot(*cast(y), *cast(x)) ? 0 : -1;
 }
 
 ////////////////////////////////////////////////
@@ -405,6 +558,10 @@ void mclBnGT_neg(mclBnGT *y, const mclBnGT *x)
 }
 void mclBnGT_inv(mclBnGT *y, const mclBnGT *x)
 {
+	Fp12::unitaryInv(*cast(y), *cast(x));
+}
+void mclBnGT_invGeneric(mclBnGT *y, const mclBnGT *x)
+{
 	Fp12::inv(*cast(y), *cast(x));
 }
 void mclBnGT_sqr(mclBnGT *y, const mclBnGT *x)
@@ -437,6 +594,19 @@ void mclBnGT_powGeneric(mclBnGT *z, const mclBnGT *x, const mclBnFr *y)
 	Fp12::powGeneric(*cast(z), *cast(x), *cast(y));
 }
 
+void mclBnG1_mulVec(mclBnG1 *z, const mclBnG1 *x, const mclBnFr *y, mclSize n)
+{
+	G1::mulVec(*cast(z), cast(x), cast(y), n);
+}
+void mclBnG2_mulVec(mclBnG2 *z, const mclBnG2 *x, const mclBnFr *y, mclSize n)
+{
+	G2::mulVec(*cast(z), cast(x), cast(y), n);
+}
+void mclBnGT_powVec(mclBnGT *z, const mclBnGT *x, const mclBnFr *y, mclSize n)
+{
+	GT::powVec(*cast(z), cast(x), cast(y), n);
+}
+
 void mclBn_pairing(mclBnGT *z, const mclBnG1 *x, const mclBnG2 *y)
 {
 	pairing(*cast(z), *cast(x), *cast(y));
@@ -448,6 +618,10 @@ void mclBn_finalExp(mclBnGT *y, const mclBnGT *x)
 void mclBn_millerLoop(mclBnGT *z, const mclBnG1 *x, const mclBnG2 *y)
 {
 	millerLoop(*cast(z), *cast(x), *cast(y));
+}
+void mclBn_millerLoopVec(mclBnGT *z, const mclBnG1 *x, const mclBnG2 *y, mclSize n)
+{
+	millerLoopVec(*cast(z), cast(x), cast(y), n);
 }
 int mclBn_getUint64NumToPrecompute(void)
 {
@@ -519,5 +693,140 @@ void mclBn_verifyOrderG1(int doVerify)
 void mclBn_verifyOrderG2(int doVerify)
 {
 	verifyOrderG2(doVerify != 0);
+}
+
+void mclBnFp_setInt(mclBnFp *y, mclInt x)
+{
+	*cast(y) = x;
+}
+void mclBnFp_setInt32(mclBnFp *y, int x)
+{
+	*cast(y) = x;
+}
+
+mclSize mclBnFp_getStr(char *buf, mclSize maxBufSize, const mclBnFp *x, int ioMode)
+{
+	return cast(x)->getStr(buf, maxBufSize, ioMode);
+}
+int mclBnFp_setStr(mclBnFp *x, const char *buf, mclSize bufSize, int ioMode)
+{
+	return setStr(x, buf, bufSize, ioMode);
+}
+mclSize mclBnFp_deserialize(mclBnFp *x, const void *buf, mclSize bufSize)
+{
+	return (mclSize)cast(x)->deserialize(buf, bufSize);
+}
+
+mclSize mclBnFp_serialize(void *buf, mclSize maxBufSize, const mclBnFp *x)
+{
+	return (mclSize)cast(x)->serialize(buf, maxBufSize);
+}
+
+void mclBnFp_clear(mclBnFp *x)
+{
+	cast(x)->clear();
+}
+
+int mclBnFp_setLittleEndian(mclBnFp *x, const void *buf, mclSize bufSize)
+{
+	cast(x)->setArrayMask((const char *)buf, bufSize);
+	return 0;
+}
+
+int mclBnFp_setLittleEndianMod(mclBnFp *x, const void *buf, mclSize bufSize)
+{
+	bool b;
+	cast(x)->setLittleEndianMod(&b, buf, bufSize);
+	return b ? 0 : -1;
+}
+
+int mclBnFp_setBigEndianMod(mclBnFp *x, const void *buf, mclSize bufSize)
+{
+	bool b;
+	cast(x)->setBigEndianMod(&b, buf, bufSize);
+	return b ? 0 : -1;
+}
+
+mclSize mclBnFp_getLittleEndian(void *buf, mclSize maxBufSize, const mclBnFp *x)
+{
+	return cast(x)->getLittleEndian(buf, maxBufSize);
+}
+int mclBnFp_isValid(const mclBnFp *x)
+{
+	return cast(x)->isValid();
+}
+int mclBnFp_isEqual(const mclBnFp *x, const mclBnFp *y)
+{
+	return *cast(x) == *cast(y);
+}
+int mclBnFp_isZero(const mclBnFp *x)
+{
+	return cast(x)->isZero();
+}
+int mclBnFp_isOne(const mclBnFp *x)
+{
+	return cast(x)->isOne();
+}
+int mclBnFp_isOdd(const mclBnFp *x)
+{
+	return cast(x)->isOdd();
+}
+int mclBnFp_isNegative(const mclBnFp *x)
+{
+	return cast(x)->isNegative();
+}
+
+int mclBnFp_setHashOf(mclBnFp *x, const void *buf, mclSize bufSize)
+{
+	cast(x)->setHashOf(buf, bufSize);
+	return 0;
+}
+
+int mclBnFp_mapToG1(mclBnG1 *y, const mclBnFp *x)
+{
+	bool b;
+	mapToG1(&b, *cast(y), *cast(x));
+	return b ? 0 : -1;
+}
+
+mclSize mclBnFp2_deserialize(mclBnFp2 *x, const void *buf, mclSize bufSize)
+{
+	return (mclSize)cast(x)->deserialize(buf, bufSize);
+}
+
+mclSize mclBnFp2_serialize(void *buf, mclSize maxBufSize, const mclBnFp2 *x)
+{
+	return (mclSize)cast(x)->serialize(buf, maxBufSize);
+}
+
+void mclBnFp2_clear(mclBnFp2 *x)
+{
+	cast(x)->clear();
+}
+
+int mclBnFp2_isEqual(const mclBnFp2 *x, const mclBnFp2 *y)
+{
+	return *cast(x) == *cast(y);
+}
+int mclBnFp2_isZero(const mclBnFp2 *x)
+{
+	return cast(x)->isZero();
+}
+int mclBnFp2_isOne(const mclBnFp2 *x)
+{
+	return cast(x)->isOne();
+}
+
+int mclBnFp2_mapToG2(mclBnG2 *y, const mclBnFp2 *x)
+{
+	bool b;
+	mapToG2(&b, *cast(y), *cast(x));
+	return b ? 0 : -1;
+}
+
+int mclBnG1_getBasePoint(mclBnG1 *x)
+{
+	*cast(x) = mcl::bn::getG1basePoint();
+	return 0;
 }
 

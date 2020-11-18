@@ -25,8 +25,8 @@ void mul9(const mcl::fp::Op& op, Unit *y, const Unit *x, const Unit *p)
 
 void benchRaw(const char *p, mcl::fp::Mode mode)
 {
-	Fp::init(p, mode);
-	Fp2::init(1);
+	Fp::init(1, p, mode);
+	Fp2::init();
 	const size_t maxN = sizeof(Fp) / sizeof(Unit);
 	const mcl::fp::Op& op = Fp::getOp();
 	cybozu::XorShift rg;
@@ -168,7 +168,7 @@ int main(int argc, char *argv[])
 		benchRaw(tbl[i], mcl::fp::FP_LLVM);
 		benchRaw(tbl[i], mcl::fp::FP_LLVM_MONT);
 #endif
-#ifdef MCL_USE_XBYAK
+#ifdef MCL_X64_ASM
 		if (bitSize <= 384) {
 			benchRaw(tbl[i], mcl::fp::FP_XBYAK);
 		}

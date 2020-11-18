@@ -7,9 +7,6 @@
 	http://opensource.org/licenses/BSD-3-Clause
 */
 #if CYBOZU_HOST == CYBOZU_HOST_INTEL
-#define XBYAK_NO_OP_NAMES
-#define XBYAK_DISABLE_AVX512
-#include "xbyak/xbyak_util.h"
 
 #if MCL_SIZEOF_UNIT == 8
 #include <stdio.h>
@@ -24,6 +21,66 @@
 #endif
 
 namespace mcl {
+
+#ifdef MCL_DUMP_JIT
+struct DumpCode {
+	FILE *fp_;
+	DumpCode()
+		: fp_(stdout)
+	{
+	}
+	void set(const std::string& name, const uint8_t *begin, const size_t size)
+	{
+		fprintf(fp_, "segment .text\n");
+		fprintf(fp_, "global %s\n", name.c_str());
+		fprintf(fp_, "align 16\n");
+		fprintf(fp_, "%s:\n", name.c_str());
+		const uint8_t *p = begin;
+		size_t remain = size;
+		while (remain > 0) {
+			size_t n = remain >= 16 ? 16 : remain;
+			fprintf(fp_, "db ");
+			for (size_t i = 0; i < n; i++) {
+				fprintf(fp_, "0x%02x,", *p++);
+			}
+			fprintf(fp_, "\n");
+			remain -= n;
+		}
+	}
+	void dumpData(const void *begin, const void *end)
+	{
+		fprintf(fp_, "align 16\n");
+		fprintf(fp_, "dq ");
+		const uint64_t *p = (const uint64_t*)begin;
+		const uint64_t *pe = (const uint64_t*)end;
+		const size_t n = pe - p;
+		for (size_t i = 0; i < n; i++) {
+			fprintf(fp_, "0x%016llx,", (unsigned long long)*p++);
+		}
+		fprintf(fp_, "\n");
+	}
+};
+template<class T>
+void setFuncInfo(DumpCode& prof, const char *suf, const char *name, const T& begin, const uint8_t* end)
+{
+	if (suf == 0) suf = "";
+	const uint8_t*p = (const uint8_t*)begin;
+#ifdef __APPLE__
+	std::string pre = "_mclx_";
+#else
+	std::string pre = "mclx_";
+#endif
+	prof.set(pre + suf + name, p, end - p);
+}
+#else
+template<class T>
+void setFuncInfo(Xbyak::util::Profiler& prof, const char *suf, const char *name, const T& begin, const uint8_t* end)
+{
+	if (suf == 0) suf = "";
+	const uint8_t*p = (const uint8_t*)begin;
+	prof.set((std::string("mclx_") + suf + name).c_str(), p, end - p);
+}
+#endif
 
 namespace fp_gen_local {
 
@@ -50,7 +107,7 @@ struct MixPack {
 	}
 	void init(Xbyak::util::Pack& remain, size_t& rspPos, size_t n, size_t useRegNum = useAll)
 	{
-		size_t pn = std::min(remain.size(), n);
+		size_t pn = (std::min)(remain.size(), n);
 		if (useRegNum != useAll && useRegNum < pn) pn = useRegNum;
 		this->mn = n - pn;
 		this->m = Xbyak::util::rsp + rspPos;
@@ -78,7 +135,7 @@ struct MixPack {
 	}
 	void removeLast()
 	{
-		if (!size()) throw cybozu::Exception("MixPack:removeLast:empty");
+		assert(size());
 		if (mn > 0) {
 			mn--;
 		} else {
@@ -176,9 +233,6 @@ struct FpGenerator : Xbyak::CodeGenerator {
 		Ext2(const Ext2&);
 		void operator=(const Ext2&);
 	};
-	Xbyak::util::Cpu cpu_;
-	bool useMulx_;
-	bool  useAdx_;
 	const Reg64& gp0;
 	const Reg64& gp1;
 	const Reg64& gp2;
@@ -203,22 +257,13 @@ struct FpGenerator : Xbyak::CodeGenerator {
 	int pn_;
 	int FpByte_;
 	bool isFullBit_;
-	// add/sub without carry. return true if overflow
-	typedef bool (*bool3op)(uint64_t*, const uint64_t*, const uint64_t*);
-
-	// add/sub with mod
-//	typedef void (*void3op)(uint64_t*, const uint64_t*, const uint64_t*);
-
-	// mul without carry. return top of z
-	typedef uint64_t (*uint3opI)(uint64_t*, const uint64_t*, uint64_t);
-
-	// neg
-	typedef void (*void2op)(uint64_t*, const uint64_t*);
-
-	// preInv
-	typedef int (*int2op)(uint64_t*, const uint64_t*);
-	void4u mul_;
-//	uint3opI mulUnit_;
+	bool useMulx_;
+	bool useAdx_;
+#ifdef MCL_DUMP_JIT
+	DumpCode prof_;
+#else
+	Xbyak::util::Profiler prof_;
+#endif
 
 	/*
 		@param op [in] ; use op.p, op.N, op.isFullBit
@@ -253,96 +298,168 @@ struct FpGenerator : Xbyak::CodeGenerator {
 		, rp_(0)
 		, pn_(0)
 		, FpByte_(0)
-		, mul_(0)
-//		, mulUnit_(0)
 	{
-		useMulx_ = cpu_.has(Xbyak::util::Cpu::tBMI2);
-		useAdx_ = cpu_.has(Xbyak::util::Cpu::tADX);
 	}
-	void init(Op& op)
+	bool init(Op& op, const Xbyak::util::Cpu& cpu)
 	{
+#ifdef MCL_DUMP_JIT
+		useMulx_ = true;
+		useAdx_ = true;
+		(void)cpu;
+#else
+		if (!cpu.has(Xbyak::util::Cpu::tAVX)) return false;
+		useMulx_ = cpu.has(Xbyak::util::Cpu::tBMI2);
+		useAdx_ = cpu.has(Xbyak::util::Cpu::tADX);
+#endif
 		reset(); // reset jit code for reuse
 		setProtectModeRW(); // read/write memory
 		init_inner(op);
+		// ToDo : recover op if false
+		if (Xbyak::GetError()) return false;
+//		printf("code size=%d\n", (int)getSize());
 		setProtectModeRE(); // set read/exec memory
+		return true;
 	}
 private:
 	void init_inner(Op& op)
 	{
+		const char *suf = op.xi_a ? "Fp" : "Fr";
 		op_ = &op;
-		if (!cpu_.has(Xbyak::util::Cpu::tAVX)) return;
-		/*
-			first 4096-byte is data area
-			remain is code area
-		*/
 		L(pL_);
 		p_ = reinterpret_cast<const uint64_t*>(getCurr());
 		for (size_t i = 0; i < op.N; i++) {
 			dq(op.p[i]);
 		}
+#ifdef MCL_DUMP_JIT
+		prof_.dumpData(p_, getCurr());
+#endif
 		rp_ = fp::getMontgomeryCoeff(p_[0]);
 		pn_ = (int)op.N;
 		FpByte_ = int(op.maxN * sizeof(uint64_t));
 		isFullBit_ = op.isFullBit;
 //		printf("p=%p, pn_=%d, isFullBit_=%d\n", p_, pn_, isFullBit_);
-		// code from here
-		setSize(4096);
-		assert((getCurr<size_t>() & 4095) == 0);
+#ifdef MCL_USE_PROF
+		int profMode = 0;
+#ifdef XBYAK_USE_VTUNE
+		profMode = 2;
+#endif
+		{
+			const char *s = getenv("MCL_PROF");
+			if (s && s[0] && s[1] == '\0') profMode = s[0] - '0';
+		}
+		if (profMode) {
+			prof_.init(profMode);
+			prof_.setStartAddr(getCurr());
+		}
+#else
+		(void)suf;
+#endif
+
+		align(16);
 		op.fp_addPre = gen_addSubPre(true, pn_);
+		setFuncInfo(prof_, suf, "_addPre", op.fp_addPre, getCurr());
+
+		align(16);
 		op.fp_subPre = gen_addSubPre(false, pn_);
-		op.fp_subA_ = gen_fp_sub();
+		setFuncInfo(prof_, suf, "_subPre", op.fp_subPre, getCurr());
+
+		align(16);
 		op.fp_addA_ = gen_fp_add();
+		setFuncInfo(prof_, suf, "_add", op.fp_addA_, getCurr());
 
+		align(16);
+		op.fp_subA_ = gen_fp_sub();
+		setFuncInfo(prof_, suf, "_sub", op.fp_subA_, getCurr());
+
+		align(16);
 		op.fp_shr1 = gen_shr1();
+		setFuncInfo(prof_, suf, "_shr1", op.fp_shr1, getCurr());
 
+		align(16);
 		op.fp_negA_ = gen_fp_neg();
+		setFuncInfo(prof_, suf, "_neg", op.fp_negA_, getCurr());
+		align(16);
+		op.fpDbl_modA_ = gen_fpDbl_mod(op);
+		setFuncInfo(prof_, suf, "Dbl_mod", op.fpDbl_modA_, getCurr());
+		align(16);
+		op.fp_mulA_ = gen_mul();
+		setFuncInfo(prof_, suf, "_mul", op.fp_mulA_, getCurr());
 
-		void* func = 0;
-		// setup fp_tower
-		op.fp2_mulNF = 0;
-		func = gen_fpDbl_add();
-		if (func) op.fpDbl_addA_ = reinterpret_cast<void3u>(func);
-		func = gen_fpDbl_sub();
-		if (func) op.fpDbl_subA_ = reinterpret_cast<void3u>(func);
-		op.fpDbl_addPre = gen_addSubPre(true, pn_ * 2);
-		op.fpDbl_subPre = gen_addSubPre(false, pn_ * 2);
-
-		func = gen_fpDbl_mulPre();
-		if (func) op.fpDbl_mulPreA_ = reinterpret_cast<void3u>(func);
-
-		func = gen_fpDbl_mod(op);
-		if (func) op.fpDbl_modA_ = reinterpret_cast<void2u>(func);
-
-		func = gen_fpDbl_sqrPre(op);
-		if (func) op.fpDbl_sqrPreA_ = reinterpret_cast<void2u>(func);
-
-		func = gen_mul();
-		if (func) {
-			op.fp_mul = reinterpret_cast<void4u>(func); // used in toMont/fromMont
-			op.fp_mulA_ = reinterpret_cast<void3u>(func);
+		if (op.fp_mulA_) {
+			op.fp_mul = fp::func_ptr_cast<void4u>(op.fp_mulA_); // used in toMont/fromMont
 		}
-		func = gen_sqr();
-		if (func) {
-			op.fp_sqrA_ = reinterpret_cast<void2u>(func);
-		}
-		if (op.primeMode != PM_NIST_P192 && op.N <= 4) { // support general op.N but not fast for op.N > 4
+
+		align(16);
+		op.fp_sqrA_ = gen_sqr();
+		setFuncInfo(prof_, suf, "_sqr", op.fp_sqrA_, getCurr());
+
+		if (op.primeMode != PM_NIST_P192 && op.N <= 6) { // support general op.N but not fast for op.N > 4
 			align(16);
 			op.fp_preInv = getCurr<int2u>();
 			gen_preInv();
+			setFuncInfo(prof_, suf, "_preInv", op.fp_preInv, getCurr());
 		}
+		if (op.xi_a == 0) return; // Fp2 is not used
+		align(16);
+		op.fpDbl_addA_ = gen_fpDbl_add();
+		setFuncInfo(prof_, suf, "Dbl_add", op.fpDbl_addA_, getCurr());
+
+		align(16);
+		op.fpDbl_subA_ = gen_fpDbl_sub();
+		setFuncInfo(prof_, suf, "Dbl_sub", op.fpDbl_subA_, getCurr());
+
+		align(16);
+		op.fpDbl_addPre = gen_addSubPre(true, pn_ * 2);
+		setFuncInfo(prof_, suf, "Dbl_addPre", op.fpDbl_addPre, getCurr());
+
+		align(16);
+		op.fpDbl_subPre = gen_addSubPre(false, pn_ * 2);
+		setFuncInfo(prof_, suf, "Dbl_subPre", op.fpDbl_subPre, getCurr());
+
+		align(16);
+		op.fpDbl_mulPreA_ = gen_fpDbl_mulPre();
+		setFuncInfo(prof_, suf, "Dbl_mulPre", op.fpDbl_mulPreA_, getCurr());
+
+		align(16);
+		op.fpDbl_sqrPreA_ = gen_fpDbl_sqrPre();
+		setFuncInfo(prof_, suf, "Dbl_sqrPre", op.fpDbl_sqrPreA_, getCurr());
+
+		align(16);
 		op.fp2_addA_ = gen_fp2_add();
+		setFuncInfo(prof_, suf, "2_add", op.fp2_addA_, getCurr());
+
+		align(16);
 		op.fp2_subA_ = gen_fp2_sub();
+		setFuncInfo(prof_, suf, "2_sub", op.fp2_subA_, getCurr());
+
+		align(16);
 		op.fp2_negA_ = gen_fp2_neg();
+		setFuncInfo(prof_, suf, "2_neg", op.fp2_negA_, getCurr());
+
+		op.fp2_mulNF = 0;
+		align(16);
 		op.fp2Dbl_mulPreA_ = gen_fp2Dbl_mulPre();
+		if (op.fp2Dbl_mulPreA_) setFuncInfo(prof_, suf, "2Dbl_mulPre", op.fp2Dbl_mulPreA_, getCurr());
+
+		align(16);
 		op.fp2Dbl_sqrPreA_ = gen_fp2Dbl_sqrPre();
+		if (op.fp2Dbl_sqrPreA_) setFuncInfo(prof_, suf, "2Dbl_sqrPre", op.fp2Dbl_sqrPreA_, getCurr());
+
+		align(16);
 		op.fp2_mulA_ = gen_fp2_mul();
+		setFuncInfo(prof_, suf, "2_mul", op.fp2_mulA_, getCurr());
+
+		align(16);
 		op.fp2_sqrA_ = gen_fp2_sqr();
+		setFuncInfo(prof_, suf, "2_sqr", op.fp2_sqrA_, getCurr());
+
+		align(16);
 		op.fp2_mul_xiA_ = gen_fp2_mul_xi();
+		setFuncInfo(prof_, suf, "2_mul_xi", op.fp2_mul_xiA_, getCurr());
 	}
 	u3u gen_addSubPre(bool isAdd, int n)
 	{
 //		if (isFullBit_) return 0;
-		align(16);
 		u3u func = getCurr<u3u>();
 		StackFrame sf(this, 3);
 		if (isAdd) {
@@ -403,7 +520,7 @@ private:
 		}
 		jmp(exit);
 	L(nonZero);
-		mov(rax, pL_);
+		lea(rax, ptr[rip+pL_]);
 		for (size_t i = 0; i < t.size(); i++) {
 			mov(rdx, ptr [rax + i * 8]);
 			if (i == 0) {
@@ -493,7 +610,7 @@ private:
 	void gen_mulUnit()
 	{
 //		assert(pn_ >= 2);
-		const int regNum = useMulx_ ? 2 : (1 + std::min(pn_ - 1, 8));
+		const int regNum = useMulx_ ? 2 : (1 + (std::min)(pn_ - 1, 8));
 		const int stackSize = useMulx_ ? 0 : (pn_ - 1) * 8;
 		StackFrame sf(this, 3, regNum | UseRDX, stackSize);
 		const Reg64& pz = sf.p[0];
@@ -531,7 +648,7 @@ private:
 			mov(*fullReg, 0);
 			adc(*fullReg, 0);
 		}
-		mov(rax, pL_);
+		lea(rax, ptr[rip+pL_]);
 		sub_rm(p1, rax);
 		if (fullReg) {
 			sbb(*fullReg, 0);
@@ -551,7 +668,7 @@ private:
 		const Pack& p1 = t.sub(pn_, pn_);
 		load_rm(p0, px);
 		sub_rm(p0, py, withCarry);
-		mov(rax, pL_);
+		lea(rax, ptr[rip+pL_]);
 		load_rm(p1, rax);
 		sbb(rax, rax); // rax = (x > y) ? 0 : -1
 		for (size_t i = 0; i < p1.size(); i++) {
@@ -592,7 +709,7 @@ private:
 		Label exit;
 		if (isFullBit_) {
 			jnc("@f");
-			mov(t2[0], pL_); // t2 is not used
+			lea(t2[0], ptr[rip+pL_]); // t2[0] is not used
 			sub_rm(t1, t2[0]);
 			jmp(exit);
 		L("@@");
@@ -622,7 +739,6 @@ private:
 	}
 	void3u gen_fp_add()
 	{
-		align(16);
 		void3u func = getCurr<void3u>();
 		if (pn_ <= 4) {
 			gen_fp_add_le4();
@@ -640,7 +756,7 @@ private:
 
 		inLocalLabel();
 		gen_raw_add(pz, px, py, rax, pn_);
-		mov(px, pL_); // destroy px
+		lea(px, ptr[rip+pL_]);
 		if (isFullBit_) {
 			jc(".over", jmpMode);
 		}
@@ -668,10 +784,9 @@ private:
 		outLocalLabel();
 		return func;
 	}
-	void* gen_fpDbl_add()
+	void3u gen_fpDbl_add()
 	{
-		align(16);
-		void* func = getCurr<void*>();
+		void3u func = getCurr<void3u>();
 		if (pn_ <= 4) {
 			int tn = pn_ * 2 + (isFullBit_ ? 1 : 0);
 			StackFrame sf(this, 3, tn);
@@ -696,10 +811,9 @@ private:
 		}
 		return 0;
 	}
-	void* gen_fpDbl_sub()
+	void3u gen_fpDbl_sub()
 	{
-		align(16);
-		void* func = getCurr<void*>();
+		void3u func = getCurr<void3u>();
 		if (pn_ <= 4) {
 			int tn = pn_ * 2;
 			StackFrame sf(this, 3, tn);
@@ -748,7 +862,6 @@ private:
 	}
 	void3u gen_fp_sub()
 	{
-		align(16);
 		void3u func = getCurr<void3u>();
 		if (pn_ <= 4) {
 			gen_fp_sub_le4();
@@ -766,14 +879,13 @@ private:
 		Label exit;
 		gen_raw_sub(pz, px, py, rax, pn_);
 		jnc(exit, jmpMode);
-		mov(px, pL_);
+		lea(px, ptr[rip+pL_]);
 		gen_raw_add(pz, pz, px, rax, pn_);
 	L(exit);
 		return func;
 	}
 	void2u gen_fp_neg()
 	{
-		align(16);
 		void2u func = getCurr<void2u>();
 		StackFrame sf(this, 2, UseRDX | pn_);
 		gen_raw_neg(sf.p[0], sf.p[1], sf.t);
@@ -781,7 +893,6 @@ private:
 	}
 	void2u gen_shr1()
 	{
-		align(16);
 		void2u func = getCurr<void2u>();
 		const int c = 1;
 		StackFrame sf(this, 2, 1);
@@ -800,10 +911,9 @@ private:
 		mov(ptr [pz + (pn_ - 1) * 8], *t0);
 		return func;
 	}
-	void* gen_mul()
+	void3u gen_mul()
 	{
-		align(16);
-		void* func = getCurr<void*>();
+		void3u func = getCurr<void3u>();
 		if (op_->primeMode == PM_NIST_P192) {
 			StackFrame sf(this, 3, 10 | UseRDX, 8 * 6);
 			mulPre3(rsp, sf.p[1], sf.p[2], sf.t);
@@ -875,7 +985,7 @@ private:
 
 		mov(a, rp_);
 		mul(t6);
-		mov(t0, pL_);
+		lea(t0, ptr[rip+pL_]);
 		mov(t7, a); // q
 
 		// [d:t7:t1] = p * q
@@ -944,7 +1054,7 @@ private:
 
 		mov(a, rp_);
 		mul(t10);
-		mov(t0, pL_);
+		lea(t0, ptr[rip+pL_]);
 		mov(t7, a); // q
 
 		// [d:t7:t2:t1] = p * q
@@ -1024,7 +1134,7 @@ private:
 
 		mov(a, rp_);
 		mul(z);
-		mov(t0, pL_);
+		lea(t0, ptr[rip+pL_]);
 		mov(t7, a); // q
 
 		// [d:t7:t3:t2:t1] = p * q
@@ -1113,10 +1223,9 @@ private:
 		vmovq(z, xm0);
 		store_mr(z, Pack(t10, t9, t8, t4));
 	}
-	void* gen_fpDbl_mod(const fp::Op& op)
+	void2u gen_fpDbl_mod(const fp::Op& op)
 	{
-		align(16);
-		void* func = getCurr<void*>();
+		void2u func = getCurr<void2u>();
 		if (op.primeMode == PM_NIST_P192) {
 			StackFrame sf(this, 2, 6 | UseRDX);
 			fpDbl_mod_NIST_P192(sf.p[0], sf.p[1], sf.t);
@@ -1159,10 +1268,9 @@ private:
 		}
 		return 0;
 	}
-	void* gen_sqr()
+	void2u gen_sqr()
 	{
-		align(16);
-		void* func = getCurr<void*>();
+		void2u func = getCurr<void2u>();
 		if (op_->primeMode == PM_NIST_P192) {
 			StackFrame sf(this, 3, 10 | UseRDX, 6 * 8);
 			Pack t = sf.t;
@@ -1224,7 +1332,7 @@ private:
 	void gen_montMulN(const uint64_t *p, uint64_t pp, int n)
 	{
 		assert(1 <= pn_ && pn_ <= 9);
-		const int regNum = useMulx_ ? 4 : 3 + std::min(n - 1, 7);
+		const int regNum = useMulx_ ? 4 : 3 + (std::min)(n - 1, 7);
 		const int stackSize = (n * 3 + (isFullBit_ ? 2 : 1)) * 8;
 		StackFrame sf(this, 3, regNum | UseRDX, stackSize);
 		const Reg64& pz = sf.p[0];
@@ -1282,7 +1390,7 @@ private:
 
 	L(fp_mulL);
 		vmovq(xm0, p0); // save p0
-		mov(p0, pL_);
+		lea(p0, ptr[rip+pL_]);
 		vmovq(xm1, p2);
 		mov(p2, ptr [p2]);
 		montgomery4_1(rp_, t0, t7, t3, t2, t1, p1, p2, p0, t4, t5, t6, t8, t9, true, xm2);
@@ -1378,7 +1486,7 @@ private:
 		mov(a, rp_);
 		mul(c[0]); // q = a
 		mov(d, a);
-		mov(t1, pL_);
+		lea(t1, ptr[rip+pL_]);
 		// c += p * q
 		mulAdd(c, 6, t1);
 	}
@@ -1424,7 +1532,7 @@ private:
 		const Pack z = Pack(t3, t2, t1, t0, t7, t6);
 		const Pack keep = Pack(rdx, rax, px, py, t8, t9);
 		mov_rr(keep, z);
-		mov(t5, pL_);
+		lea(t5, ptr[rip+pL_]);
 		sub_rm(z, t5);
 		cmovc_rr(z, keep);
 		store_mr(pz, z);
@@ -1454,7 +1562,7 @@ private:
 		const Reg64& t9 = sf.t[9];
 
 		vmovq(xm0, p0); // save p0
-		mov(t7, pL_);
+		lea(t7, ptr[rip+pL_]);
 		mov(t9, ptr [p2]);
 		//                c3, c2, c1, c0, px, y,  p,
 		montgomery3_1(rp_, t0, t3, t2, t1, p1, t9, t7, t4, t5, t6, t8, p0, true);
@@ -1500,7 +1608,7 @@ private:
 		const Reg64& t9 = sf.t[9];
 
 		vmovq(xm0, pz); // save pz
-		mov(t7, pL_);
+		lea(t7, ptr[rip+pL_]);
 		mov(t9, ptr [px]);
 		mul3x1_sqr1(px, t9, t3, t2, t1, t0);
 		mov(t0, rdx);
@@ -1798,9 +1906,7 @@ private:
 	*/
 	void sqr2(const Reg64& y3, const Reg64& y2, const Reg64& y1, const Reg64& y0, const Reg64& x1, const Reg64& x0, const Reg64& t1, const Reg64& t0)
 	{
-		if (!useMulx_) {
-			throw cybozu::Exception("sqr2:not support mulx");
-		}
+		assert(useMulx_);
 		mov(rdx, x0);
 		mulx(y1, y0, x0); // x0^2
 		mov(rdx, x1);
@@ -1819,9 +1925,7 @@ private:
 	*/
 	void mul2x2(const RegExp& px, const RegExp& py, const Reg64& t4, const Reg64& t3, const Reg64& t2, const Reg64& t1, const Reg64& t0)
 	{
-		if (!useMulx_) {
-			throw cybozu::Exception("mul2x2:not support mulx");
-		}
+		assert(useMulx_);
 #if 0
 		// # of add is less, but a little slower
 		mov(t4, ptr [py + 8 * 0]);
@@ -2267,10 +2371,9 @@ private:
 		vmovq(z, xm0);
 		store_mr(z, zp);
 	}
-	void* gen_fpDbl_sqrPre(const fp::Op&/* op */)
+	void2u gen_fpDbl_sqrPre()
 	{
-		align(16);
-		void* func = getCurr<void*>();
+		void2u func = getCurr<void2u>();
 		if (pn_ == 2 && useMulx_) {
 			StackFrame sf(this, 2, 7 | UseRDX);
 			sqrPre2(sf.p[0], sf.p[1], sf.t);
@@ -2308,10 +2411,9 @@ private:
 		return func;
 #endif
 	}
-	void* gen_fpDbl_mulPre()
+	void3u gen_fpDbl_mulPre()
 	{
-		align(16);
-		void* func = getCurr<void*>();
+		void3u func = getCurr<void3u>();
 		if (pn_ == 2 && useMulx_) {
 			StackFrame sf(this, 3, 5 | UseRDX);
 			mulPre2(sf.p[0], sf.p[1], sf.p[2], sf.t);
@@ -2574,7 +2676,7 @@ private:
 	*/
 	void gen_preInv()
 	{
-		assert(1 <= pn_ && pn_ <= 4);
+		assert(1 <= pn_ && pn_ <= 6);
 		const int freeRegNum = 13;
 		StackFrame sf(this, 2, 10 | UseRDX | UseRCX, (std::max<int>(0, pn_ * 5 - freeRegNum) + 1 + (isFullBit_ ? 1 : 0)) * 8);
 		const Reg64& pr = sf.p[0];
@@ -2608,7 +2710,7 @@ private:
 		mov(rax, px);
 		// px is free frome here
 		load_mp(vv, rax, t); // v = x
-		mov(rax, pL_);
+		lea(rax, ptr[rip+pL_]);
 		load_mp(uu, rax, t); // u = p_
 		// k = 0
 		xor_(rax, rax);
@@ -2686,7 +2788,7 @@ private:
 		const Reg64& t2 = ss.getReg(0);
 		const Reg64& t3 = rdx;
 
-		mov(t2, pL_);
+		lea(t2, ptr[rip+pL_]);
 		if (isFullBit_) {
 			mov(t, ptr [rTop]);
 			test(t, t);
@@ -3351,7 +3453,6 @@ private:
 //		if (pn_ != 4 && !(pn_ == 6 && useMulx_ && useAdx_)) return 0;
 		// almost same for pn_ == 6
 		if (pn_ != 4) return 0;
-		align(16);
 		void3u func = getCurr<void3u>();
 
 		const RegExp z = rsp + 0 * 8;
@@ -3416,7 +3517,6 @@ private:
 //		if (pn_ != 4 && !(pn_ == 6 && useMulx_ && useAdx_)) return 0;
 		// almost same for pn_ == 6
 		if (pn_ != 4) return 0;
-		align(16);
 		void2u func = getCurr<void2u>();
 		// almost same for pn_ == 6
 		if (pn_ != 4) return 0;
@@ -3502,7 +3602,6 @@ private:
 	}
 	void3u gen_fp2_add()
 	{
-		align(16);
 		void3u func = getCurr<void3u>();
 		if (pn_ == 4 && !isFullBit_) {
 			gen_fp2_add4();
@@ -3516,7 +3615,6 @@ private:
 	}
 	void3u gen_fp2_sub()
 	{
-		align(16);
 		void3u func = getCurr<void3u>();
 		if (pn_ == 4 && !isFullBit_) {
 			gen_fp2_sub4();
@@ -3562,7 +3660,7 @@ private:
 			}
 		}
 		sub_rr(a, b);
-		mov(rax, pL_);
+		lea(rax, ptr[rip+pL_]);
 		load_rm(b, rax);
 		sbb(rax, rax);
 		for (int i = 0; i < pn_; i++) {
@@ -3570,7 +3668,7 @@ private:
 		}
 		add_rr(a, b);
 		store_mr(py, a);
-		mov(rax, pL_);
+		lea(rax, ptr[rip+pL_]);
 		mov_rr(a, t);
 		sub_rm(t, rax);
 		cmovc_rr(t, a);
@@ -3588,7 +3686,7 @@ private:
 		mov_rr(b, a);
 		add_rm(b, px + FpByte_);
 		sub_rm(a, px + FpByte_);
-		mov(rax, pL_);
+		lea(rax, ptr[rip+pL_]);
 		jnc("@f");
 		add_rm(a, rax);
 	L("@@");
@@ -3601,7 +3699,7 @@ private:
 	void2u gen_fp2_mul_xi()
 	{
 		if (isFullBit_) return 0;
-		align(16);
+		if (op_->xi_a != 1) return 0;
 		void2u func = getCurr<void2u>();
 		if (pn_ == 4) {
 			gen_fp2_mul_xi4();
@@ -3615,7 +3713,6 @@ private:
 	}
 	void2u gen_fp2_neg()
 	{
-		align(16);
 		void2u func = getCurr<void2u>();
 		if (pn_ <= 6) {
 			StackFrame sf(this, 2, UseRDX | pn_);
@@ -3629,7 +3726,6 @@ private:
 	{
 		if (isFullBit_) return 0;
 		if (pn_ != 4 && !(pn_ == 6 && useMulx_ && useAdx_)) return 0;
-		align(16);
 		void3u func = getCurr<void3u>();
 		bool embedded = pn_ == 4;
 
@@ -3706,7 +3802,6 @@ private:
 	{
 		if (isFullBit_) return 0;
 		if (pn_ != 4 && !(pn_ == 6 && useMulx_ && useAdx_)) return 0;
-		align(16);
 		void2u func = getCurr<void2u>();
 
 		const RegExp y = rsp + 0 * 8;
@@ -3766,7 +3861,7 @@ private:
 				mov(ptr [(RegExp)t2 + i * 8], rax);
 			}
 			// t3 = a + p - b
-			mov(rax, pL_);
+			lea(rax, ptr[rip+pL_]);
 			add_rm(a, rax);
 			sub_rr(a, b);
 			store_mr(t3, a);

@@ -1,5 +1,64 @@
 #include <mcl/lagrange.hpp>
 
+void benchAddDblG1()
+{
+	puts("benchAddDblG1");
+	const int C = 100000;
+	G1 P1, P2, P3;
+	hashAndMapToG1(P1, "a");
+	hashAndMapToG1(P2, "b");
+	P1 += P2;
+	P2 += P1;
+	printf("z.isOne()=%d %d\n", P1.z.isOne(), P2.z.isOne());
+	CYBOZU_BENCH_C("G1::add(1)", C, G1::add, P3, P1, P2);
+	P1.normalize();
+	printf("z.isOne()=%d %d\n", P1.z.isOne(), P2.z.isOne());
+	CYBOZU_BENCH_C("G1::add(2)", C, G1::add, P3, P1, P2);
+	CYBOZU_BENCH_C("G1::add(3)", C, G1::add, P3, P2, P1);
+	P2.normalize();
+	printf("z.isOne()=%d %d\n", P1.z.isOne(), P2.z.isOne());
+	CYBOZU_BENCH_C("G1::add(4)", C, G1::add, P3, P1, P2);
+	P1 = P3;
+	printf("z.isOne()=%d\n", P1.z.isOne());
+	CYBOZU_BENCH_C("G1::dbl(1)", C, G1::dbl, P3, P1);
+	P1.normalize();
+	printf("z.isOne()=%d\n", P1.z.isOne());
+	CYBOZU_BENCH_C("G1::dbl(2)", C, G1::dbl, P3, P1);
+}
+
+void benchAddDblG2()
+{
+	puts("benchAddDblG2");
+	const int C = 100000;
+	G2 P1, P2, P3;
+	hashAndMapToG2(P1, "a");
+	hashAndMapToG2(P2, "b");
+	P1 += P2;
+	P2 += P1;
+	printf("z.isOne()=%d %d\n", P1.z.isOne(), P2.z.isOne());
+	CYBOZU_BENCH_C("G2::add(1)", C, G2::add, P3, P1, P2);
+	P1.normalize();
+	printf("z.isOne()=%d %d\n", P1.z.isOne(), P2.z.isOne());
+	CYBOZU_BENCH_C("G2::add(2)", C, G2::add, P3, P1, P2);
+	CYBOZU_BENCH_C("G2::add(3)", C, G2::add, P3, P2, P1);
+	P2.normalize();
+	printf("z.isOne()=%d %d\n", P1.z.isOne(), P2.z.isOne());
+	CYBOZU_BENCH_C("G2::add(4)", C, G2::add, P3, P1, P2);
+	P1 = P3;
+	printf("z.isOne()=%d\n", P1.z.isOne());
+	CYBOZU_BENCH_C("G2::dbl(1)", C, G2::dbl, P3, P1);
+	P1.normalize();
+	printf("z.isOne()=%d\n", P1.z.isOne());
+	CYBOZU_BENCH_C("G2::dbl(2)", C, G2::dbl, P3, P1);
+}
+
+template<class T>
+void invAdd(T& out, const T& x, const T& y)
+{
+	T::inv(out, x);
+	out += y;
+}
+
 void testBench(const G1& P, const G2& Q)
 {
 	G1 Pa;
@@ -7,13 +66,13 @@ void testBench(const G1& P, const G2& Q)
 	Fp12 e1, e2;
 	pairing(e1, P, Q);
 	Fp12::pow(e2, e1, 12345);
-	const int C = 1000;
-	const int C3 = 3000;
 	Fp x, y;
 	x.setHashOf("abc");
 	y.setHashOf("xyz");
+	const int C = 1000;
+	const int C3 = 100000;
 #if 1
-	const int C2 = 1000;
+	const int C2 = 3000;
 	mpz_class a = x.getMpz();
 	CYBOZU_BENCH_C("G1::mulCT     ", C, G1::mulCT, Pa, P, a);
 	CYBOZU_BENCH_C("G1::mul       ", C, G1::mul, Pa, Pa, a);
@@ -29,24 +88,37 @@ void testBench(const G1& P, const G2& Q)
 	G2 QQ;
 	std::string s;
 	s = P.getStr();
+	verifyOrderG1(true);
 	CYBOZU_BENCH_C("G1::setStr chk", C, PP.setStr, s);
 	verifyOrderG1(false);
 	CYBOZU_BENCH_C("G1::setStr    ", C, PP.setStr, s);
-	verifyOrderG1(true);
 	s = Q.getStr();
+	verifyOrderG2(true);
 	CYBOZU_BENCH_C("G2::setStr chk", C, QQ.setStr, s);
 	verifyOrderG2(false);
 	CYBOZU_BENCH_C("G2::setStr    ", C, QQ.setStr, s);
-	verifyOrderG2(true);
 	CYBOZU_BENCH_C("hashAndMapToG1", C, hashAndMapToG1, PP, "abc", 3);
 	CYBOZU_BENCH_C("hashAndMapToG2", C, hashAndMapToG2, QQ, "abc", 3);
 #endif
 	CYBOZU_BENCH_C("Fp::add       ", C3, Fp::add, x, x, y);
 	CYBOZU_BENCH_C("Fp::sub       ", C3, Fp::sub, x, x, y);
 	CYBOZU_BENCH_C("Fp::neg       ", C3, Fp::neg, x, x);
-	CYBOZU_BENCH_C("Fp::mul       ", 1000000, Fp::mul, x, x, y);
-	CYBOZU_BENCH_C("Fp::sqr       ", 1000000, Fp::sqr, x, x);
-	CYBOZU_BENCH_C("Fp::inv       ", C3, Fp::inv, x, x);
+	CYBOZU_BENCH_C("Fp::mul       ", C3, Fp::mul, x, x, y);
+	CYBOZU_BENCH_C("Fp::sqr       ", C3, Fp::sqr, x, x);
+	CYBOZU_BENCH_C("Fp::inv       ", C3, invAdd, x, x, y);
+	CYBOZU_BENCH_C("Fp::pow       ", C3, Fp::pow, x, x, y);
+	{
+		Fr a, b, c;
+		a.setHashOf("abc", 3);
+		b.setHashOf("123", 3);
+		CYBOZU_BENCH_C("Fr::add       ", C3, Fr::add, a, a, b);
+		CYBOZU_BENCH_C("Fr::sub       ", C3, Fr::sub, a, a, b);
+		CYBOZU_BENCH_C("Fr::neg       ", C3, Fr::neg, a, a);
+		CYBOZU_BENCH_C("Fr::mul       ", C3, Fr::mul, a, a, b);
+		CYBOZU_BENCH_C("Fr::sqr       ", C3, Fr::sqr, a, a);
+		CYBOZU_BENCH_C("Fr::inv       ", C3, invAdd, a, a, b);
+		CYBOZU_BENCH_C("Fr::pow       ", C3, Fr::pow, a, a, b);
+	}
 	Fp2 xx, yy;
 	xx.a = x;
 	xx.b = 3;
@@ -62,7 +134,7 @@ void testBench(const G1& P, const G2& Q)
 	CYBOZU_BENCH_C("Fp2::mul      ", C3, Fp2::mul, xx, xx, yy);
 	CYBOZU_BENCH_C("Fp2::mul_xi   ", C3, Fp2::mul_xi, xx, xx);
 	CYBOZU_BENCH_C("Fp2::sqr      ", C3, Fp2::sqr, xx, xx);
-	CYBOZU_BENCH_C("Fp2::inv      ", C3, Fp2::inv, xx, xx);
+	CYBOZU_BENCH_C("Fp2::inv      ", C3, invAdd, xx, xx, yy);
 	CYBOZU_BENCH_C("FpDbl::addPre ", C3, FpDbl::addPre, d1, d1, d0);
 	CYBOZU_BENCH_C("FpDbl::subPre ", C3, FpDbl::subPre, d1, d1, d0);
 	CYBOZU_BENCH_C("FpDbl::add    ", C3, FpDbl::add, d1, d1, d0);
@@ -79,14 +151,30 @@ void testBench(const G1& P, const G2& Q)
 	CYBOZU_BENCH_C("GT::sqr       ", C2, GT::sqr, e1, e1);
 	CYBOZU_BENCH_C("GT::inv       ", C2, GT::inv, e1, e1);
 #endif
-	CYBOZU_BENCH_C("FpDbl::mulPre ", 10000000, FpDbl::mulPre, d0, x, y);
-	CYBOZU_BENCH_C("pairing       ", C3, pairing, e1, P, Q);
-	CYBOZU_BENCH_C("millerLoop    ", C3, millerLoop, e1, P, Q);
-	CYBOZU_BENCH_C("finalExp      ", C3, finalExp, e1, e1);
+	CYBOZU_BENCH_C("FpDbl::mulPre ", C3, FpDbl::mulPre, d0, x, y);
+	CYBOZU_BENCH_C("pairing       ", 3000, pairing, e1, P, Q);
+	CYBOZU_BENCH_C("millerLoop    ", 3000, millerLoop, e1, P, Q);
+	CYBOZU_BENCH_C("finalExp      ", 3000, finalExp, e1, e1);
 //exit(1);
 	std::vector<Fp6> Qcoeff;
+	CYBOZU_BENCH_C("precomputeG2  ", C, precomputeG2, Qcoeff, Q);
 	precomputeG2(Qcoeff, Q);
 	CYBOZU_BENCH_C("precomputedML ", C, precomputedMillerLoop, e2, P, Qcoeff);
+	const size_t n = 7;
+	G1 Pvec[n];
+	G2 Qvec[n];
+	for (size_t i = 0; i < n; i++) {
+		char d = (char)(i + 1);
+		hashAndMapToG1(Pvec[i], &d, 1);
+		hashAndMapToG2(Qvec[i], &d, 1);
+	}
+	e2 = 1;
+	for (size_t i = 0; i < n; i++) {
+		millerLoop(e1, Pvec[i], Qvec[i]);
+		e2 *= e1;
+	}
+	CYBOZU_BENCH_C("millerLoopVec ", 3000, millerLoopVec, e1, Pvec, Qvec, n);
+	CYBOZU_TEST_EQUAL(e1, e2);
 }
 
 inline void SquareRootPrecomputeTest(const mpz_class& p)
@@ -131,4 +219,8 @@ void testLagrange()
 	Fr s;
 	mcl::LagrangeInterpolation(s, x, y, k);
 	CYBOZU_TEST_EQUAL(s, c[0]);
+	mcl::LagrangeInterpolation(s, x, y, 1);
+	CYBOZU_TEST_EQUAL(s, y[0]);
+	mcl::evaluatePolynomial(y[0], c, 1, x[0]);
+	CYBOZU_TEST_EQUAL(y[0], c[0]);
 }

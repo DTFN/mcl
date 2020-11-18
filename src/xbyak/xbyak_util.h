@@ -1,6 +1,18 @@
 #ifndef XBYAK_XBYAK_UTIL_H_
 #define XBYAK_XBYAK_UTIL_H_
 
+#ifdef XBYAK_ONLY_CLASS_CPU
+#include <stdint.h>
+#include <stdlib.h>
+#include <algorithm>
+#include <assert.h>
+#ifndef XBYAK_THROW
+	#define XBYAK_THROW(x) ;
+	#define XBYAK_THROW_RET(x, y) return y;
+#endif
+#else
+#include <string.h>
+
 /**
 	utility class and functions for Xbyak
 	Xbyak::util::Clock ; rdtsc timer
@@ -8,7 +20,13 @@
 	@note this header is UNDER CONSTRUCTION!
 */
 #include "xbyak.h"
+#endif // XBYAK_ONLY_CLASS_CPU
 
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
+	#define XBYAK_INTEL_CPU_SPECIFIC
+#endif
+
+#ifdef XBYAK_INTEL_CPU_SPECIFIC
 #ifdef _MSC_VER
 	#if (_MSC_VER < 1400) && defined(XBYAK32)
 		static inline __declspec(naked) void __cpuid(int[4], int)
@@ -47,14 +65,44 @@
 		#endif
 	#endif
 #endif
+#endif
+
+#ifdef XBYAK_USE_VTUNE
+	// -I /opt/intel/vtune_amplifier/include/ -L /opt/intel/vtune_amplifier/lib64 -ljitprofiling -ldl
+	#include <jitprofiling.h>
+	#ifdef _MSC_VER
+		#pragma comment(lib, "libittnotify.lib")
+	#endif
+	#ifdef __linux__
+		#include <dlfcn.h>
+	#endif
+#endif
+#ifdef __linux__
+	#define XBYAK_USE_PERF
+#endif
 
 namespace Xbyak { namespace util {
+
+typedef enum {
+   SmtLevel = 1,
+   CoreLevel = 2
+} IntelCpuTopologyLevel;
 
 /**
 	CPU detection class
 */
 class Cpu {
-	uint64 type_;
+	uint64_t type_;
+	//system topology
+	bool x2APIC_supported_;
+	static const size_t maxTopologyLevels = 2;
+	unsigned int numCores_[maxTopologyLevels];
+
+	static const unsigned int maxNumberCacheLevels = 10;
+	unsigned int dataCacheSize_[maxNumberCacheLevels];
+	unsigned int coresSharignDataCache_[maxNumberCacheLevels];
+	unsigned int dataCacheLevels_;
+
 	unsigned int get32bitAsBE(const char *x) const
 	{
 		return x[0] | (x[1] << 8) | (x[2] << 16) | (x[3] << 24);
@@ -65,7 +113,7 @@ class Cpu {
 	}
 	void setFamily()
 	{
-		unsigned int data[4];
+		unsigned int data[4] = {};
 		getCpuid(1, data);
 		stepping = data[0] & mask(4);
 		model = (data[0] >> 4) & mask(4);
@@ -88,6 +136,44 @@ class Cpu {
 	{
 		return (val >> base) & ((1u << (end - base)) - 1);
 	}
+	void setNumCores()
+	{
+		if ((type_ & tINTEL) == 0) return;
+
+		unsigned int data[4] = {};
+
+		 /* CAUTION: These numbers are configuration as shipped by Intel. */
+		getCpuidEx(0x0, 0, data);
+		if (data[0] >= 0xB) {
+			 /*
+				if leaf 11 exists(x2APIC is supported),
+				we use it to get the number of smt cores and cores on socket
+
+				leaf 0xB can be zeroed-out by a hypervisor
+			*/
+			x2APIC_supported_ = true;
+			for (unsigned int i = 0; i < maxTopologyLevels; i++) {
+				getCpuidEx(0xB, i, data);
+				IntelCpuTopologyLevel level = (IntelCpuTopologyLevel)extractBit(data[2], 8, 15);
+				if (level == SmtLevel || level == CoreLevel) {
+					numCores_[level - 1] = extractBit(data[1], 0, 15);
+				}
+			}
+			/*
+				Fallback values in case a hypervisor has 0xB leaf zeroed-out.
+			*/
+			numCores_[SmtLevel - 1] = (std::max)(1u, numCores_[SmtLevel - 1]);
+			numCores_[CoreLevel - 1] = (std::max)(numCores_[SmtLevel - 1], numCores_[CoreLevel - 1]);
+		} else {
+			/*
+				Failed to deremine num of cores without x2APIC support.
+				TODO: USE initial APIC ID to determine ncores.
+			*/
+			numCores_[SmtLevel - 1] = 0;
+			numCores_[CoreLevel - 1] = 0;
+		}
+
+	}
 	void setCacheHierarchy()
 	{
 		if ((type_ & tINTEL) == 0) return;
@@ -96,21 +182,12 @@ class Cpu {
 //		const unsigned int INSTRUCTION_CACHE = 2;
 		const unsigned int UNIFIED_CACHE = 3;
 		unsigned int smt_width = 0;
-		unsigned int n_cores = 0;
-		unsigned int data[4];
+		unsigned int logical_cores = 0;
+		unsigned int data[4] = {};
 
-		/*
-			if leaf 11 exists, we use it to get the number of smt cores and cores on socket
-			If x2APIC is supported, these are the only correct numbers.
-
-			leaf 0xB can be zeroed-out by a hypervisor
-		*/
-		getCpuidEx(0x0, 0, data);
-		if (data[0] >= 0xB) {
-			getCpuidEx(0xB, 0, data); // CPUID for SMT Level
-			smt_width = data[1] & 0x7FFF;
-			getCpuidEx(0xB, 1, data); // CPUID for CORE Level
-			n_cores = data[1] & 0x7FFF;
+		if (x2APIC_supported_) {
+			smt_width = numCores_[0];
+			logical_cores = numCores_[1];
 		}
 
 		/*
@@ -118,29 +195,29 @@ class Cpu {
 			the first level of data cache is not shared (which is the
 			case for every existing architecture) and use this to
 			determine the SMT width for arch not supporting leaf 11.
-			when leaf 4 reports a number of core less than n_cores
+			when leaf 4 reports a number of core less than numCores_
 			on socket reported by leaf 11, then it is a correct number
 			of cores not an upperbound.
 		*/
-		for (int i = 0; data_cache_levels < maxNumberCacheLevels; i++) {
+		for (int i = 0; dataCacheLevels_ < maxNumberCacheLevels; i++) {
 			getCpuidEx(0x4, i, data);
 			unsigned int cacheType = extractBit(data[0], 0, 4);
 			if (cacheType == NO_CACHE) break;
 			if (cacheType == DATA_CACHE || cacheType == UNIFIED_CACHE) {
-				unsigned int nb_logical_cores = extractBit(data[0], 14, 25) + 1;
-				if (n_cores != 0) { // true only if leaf 0xB is supported and valid
-					nb_logical_cores = (std::min)(nb_logical_cores, n_cores);
+				unsigned int actual_logical_cores = extractBit(data[0], 14, 25) + 1;
+				if (logical_cores != 0) { // true only if leaf 0xB is supported and valid
+					actual_logical_cores = (std::min)(actual_logical_cores, logical_cores);
 				}
-				assert(nb_logical_cores != 0);
-				data_cache_size[data_cache_levels] =
+				assert(actual_logical_cores != 0);
+				dataCacheSize_[dataCacheLevels_] =
 					(extractBit(data[1], 22, 31) + 1)
 					* (extractBit(data[1], 12, 21) + 1)
 					* (extractBit(data[1], 0, 11) + 1)
 					* (data[2] + 1);
-				if (cacheType == DATA_CACHE && smt_width == 0) smt_width = nb_logical_cores;
+				if (cacheType == DATA_CACHE && smt_width == 0) smt_width = actual_logical_cores;
 				assert(smt_width != 0);
-				cores_sharing_data_cache[data_cache_levels] = (std::max)(nb_logical_cores / smt_width, 1u);
-				data_cache_levels++;
+				coresSharignDataCache_[dataCacheLevels_] = (std::max)(actual_logical_cores / smt_width, 1u);
+				dataCacheLevels_++;
 			}
 		}
 	}
@@ -154,22 +231,25 @@ public:
 	int displayFamily; // family + extFamily
 	int displayModel; // model + extModel
 
-	// may I move these members into private?
-	static const unsigned int maxNumberCacheLevels = 10;
-	unsigned int data_cache_size[maxNumberCacheLevels];
-	unsigned int cores_sharing_data_cache[maxNumberCacheLevels];
-	unsigned int data_cache_levels;
+	unsigned int getNumCores(IntelCpuTopologyLevel level) const {
+		if (!x2APIC_supported_) XBYAK_THROW_RET(ERR_X2APIC_IS_NOT_SUPPORTED, 0)
+		switch (level) {
+		case SmtLevel: return numCores_[level - 1];
+		case CoreLevel: return numCores_[level - 1] / numCores_[SmtLevel - 1];
+		default: XBYAK_THROW_RET(ERR_X2APIC_IS_NOT_SUPPORTED, 0)
+		}
+	}
 
-	unsigned int getDataCacheLevels() const { return data_cache_levels; }
+	unsigned int getDataCacheLevels() const { return dataCacheLevels_; }
 	unsigned int getCoresSharingDataCache(unsigned int i) const
 	{
-		if (i >= data_cache_levels) throw  Error(ERR_BAD_PARAMETER);
-		return cores_sharing_data_cache[i];
+		if (i >= dataCacheLevels_) XBYAK_THROW_RET(ERR_BAD_PARAMETER, 0)
+		return coresSharignDataCache_[i];
 	}
 	unsigned int getDataCacheSize(unsigned int i) const
 	{
-		if (i >= data_cache_levels) throw  Error(ERR_BAD_PARAMETER);
-		return data_cache_size[i];
+		if (i >= dataCacheLevels_) XBYAK_THROW_RET(ERR_BAD_PARAMETER, 0)
+		return dataCacheSize_[i];
 	}
 
 	/*
@@ -177,33 +257,48 @@ public:
 	*/
 	static inline void getCpuid(unsigned int eaxIn, unsigned int data[4])
 	{
-#ifdef _MSC_VER
+#ifdef XBYAK_INTEL_CPU_SPECIFIC
+	#ifdef _MSC_VER
 		__cpuid(reinterpret_cast<int*>(data), eaxIn);
-#else
+	#else
 		__cpuid(eaxIn, data[0], data[1], data[2], data[3]);
+	#endif
+#else
+		(void)eaxIn;
+		(void)data;
 #endif
 	}
 	static inline void getCpuidEx(unsigned int eaxIn, unsigned int ecxIn, unsigned int data[4])
 	{
-#ifdef _MSC_VER
+#ifdef XBYAK_INTEL_CPU_SPECIFIC
+	#ifdef _MSC_VER
 		__cpuidex(reinterpret_cast<int*>(data), eaxIn, ecxIn);
-#else
+	#else
 		__cpuid_count(eaxIn, ecxIn, data[0], data[1], data[2], data[3]);
+	#endif
+#else
+		(void)eaxIn;
+		(void)ecxIn;
+		(void)data;
 #endif
 	}
-	static inline uint64 getXfeature()
+	static inline uint64_t getXfeature()
 	{
-#ifdef _MSC_VER
+#ifdef XBYAK_INTEL_CPU_SPECIFIC
+	#ifdef _MSC_VER
 		return _xgetbv(0);
-#else
+	#else
 		unsigned int eax, edx;
 		// xgetvb is not support on gcc 4.2
 //		__asm__ volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0));
 		__asm__ volatile(".byte 0x0f, 0x01, 0xd0" : "=a"(eax), "=d"(edx) : "c"(0));
-		return ((uint64)edx << 32) | eax;
+		return ((uint64_t)edx << 32) | eax;
+	#endif
+#else
+		return 0;
 #endif
 	}
-	typedef uint64 Type;
+	typedef uint64_t Type;
 
 	static const Type NONE = 0;
 	static const Type tMMX = 1 << 0;
@@ -240,40 +335,49 @@ public:
 	static const Type tADX = 1 << 28; // adcx, adox
 	static const Type tRDSEED = 1 << 29; // rdseed
 	static const Type tSMAP = 1 << 30; // stac
-	static const Type tHLE = uint64(1) << 31; // xacquire, xrelease, xtest
-	static const Type tRTM = uint64(1) << 32; // xbegin, xend, xabort
-	static const Type tF16C = uint64(1) << 33; // vcvtph2ps, vcvtps2ph
-	static const Type tMOVBE = uint64(1) << 34; // mobve
-	static const Type tAVX512F = uint64(1) << 35;
-	static const Type tAVX512DQ = uint64(1) << 36;
-	static const Type tAVX512_IFMA = uint64(1) << 37;
+	static const Type tHLE = uint64_t(1) << 31; // xacquire, xrelease, xtest
+	static const Type tRTM = uint64_t(1) << 32; // xbegin, xend, xabort
+	static const Type tF16C = uint64_t(1) << 33; // vcvtph2ps, vcvtps2ph
+	static const Type tMOVBE = uint64_t(1) << 34; // mobve
+	static const Type tAVX512F = uint64_t(1) << 35;
+	static const Type tAVX512DQ = uint64_t(1) << 36;
+	static const Type tAVX512_IFMA = uint64_t(1) << 37;
 	static const Type tAVX512IFMA = tAVX512_IFMA;
-	static const Type tAVX512PF = uint64(1) << 38;
-	static const Type tAVX512ER = uint64(1) << 39;
-	static const Type tAVX512CD = uint64(1) << 40;
-	static const Type tAVX512BW = uint64(1) << 41;
-	static const Type tAVX512VL = uint64(1) << 42;
-	static const Type tAVX512_VBMI = uint64(1) << 43;
+	static const Type tAVX512PF = uint64_t(1) << 38;
+	static const Type tAVX512ER = uint64_t(1) << 39;
+	static const Type tAVX512CD = uint64_t(1) << 40;
+	static const Type tAVX512BW = uint64_t(1) << 41;
+	static const Type tAVX512VL = uint64_t(1) << 42;
+	static const Type tAVX512_VBMI = uint64_t(1) << 43;
 	static const Type tAVX512VBMI = tAVX512_VBMI; // changed by Intel's manual
-	static const Type tAVX512_4VNNIW = uint64(1) << 44;
-	static const Type tAVX512_4FMAPS = uint64(1) << 45;
-	static const Type tPREFETCHWT1 = uint64(1) << 46;
-	static const Type tPREFETCHW = uint64(1) << 47;
-	static const Type tSHA = uint64(1) << 48;
-	static const Type tMPX = uint64(1) << 49;
-	static const Type tAVX512_VBMI2 = uint64(1) << 50;
-	static const Type tGFNI = uint64(1) << 51;
-	static const Type tVAES = uint64(1) << 52;
-	static const Type tVPCLMULQDQ = uint64(1) << 53;
-	static const Type tAVX512_VNNI = uint64(1) << 54;
-	static const Type tAVX512_BITALG = uint64(1) << 55;
-	static const Type tAVX512_VPOPCNTDQ = uint64(1) << 56;
+	static const Type tAVX512_4VNNIW = uint64_t(1) << 44;
+	static const Type tAVX512_4FMAPS = uint64_t(1) << 45;
+	static const Type tPREFETCHWT1 = uint64_t(1) << 46;
+	static const Type tPREFETCHW = uint64_t(1) << 47;
+	static const Type tSHA = uint64_t(1) << 48;
+	static const Type tMPX = uint64_t(1) << 49;
+	static const Type tAVX512_VBMI2 = uint64_t(1) << 50;
+	static const Type tGFNI = uint64_t(1) << 51;
+	static const Type tVAES = uint64_t(1) << 52;
+	static const Type tVPCLMULQDQ = uint64_t(1) << 53;
+	static const Type tAVX512_VNNI = uint64_t(1) << 54;
+	static const Type tAVX512_BITALG = uint64_t(1) << 55;
+	static const Type tAVX512_VPOPCNTDQ = uint64_t(1) << 56;
+	static const Type tAVX512_BF16 = uint64_t(1) << 57;
+	static const Type tAVX512_VP2INTERSECT = uint64_t(1) << 58;
+	static const Type tAMX_TILE = uint64_t(1) << 59;
+	static const Type tAMX_INT8 = uint64_t(1) << 60;
+	static const Type tAMX_BF16 = uint64_t(1) << 61;
 
 	Cpu()
 		: type_(NONE)
-		, data_cache_levels(0)
+		, x2APIC_supported_(false)
+		, numCores_()
+		, dataCacheSize_()
+		, coresSharignDataCache_()
+		, dataCacheLevels_(0)
 	{
-		unsigned int data[4];
+		unsigned int data[4] = {};
 		const unsigned int& EAX = data[0];
 		const unsigned int& EBX = data[1];
 		const unsigned int& ECX = data[2];
@@ -318,7 +422,7 @@ public:
 
 		if (type_ & tOSXSAVE) {
 			// check XFEATURE_ENABLED_MASK[2:1] = '11b'
-			uint64 bv = getXfeature();
+			uint64_t bv = getXfeature();
 			if ((bv & 6) == 6) {
 				if (ECX & (1U << 28)) type_ |= tAVX;
 				if (ECX & (1U << 12)) type_ |= tFMA;
@@ -343,6 +447,12 @@ public:
 						if (ECX & (1U << 14)) type_ |= tAVX512_VPOPCNTDQ;
 						if (EDX & (1U << 2)) type_ |= tAVX512_4VNNIW;
 						if (EDX & (1U << 3)) type_ |= tAVX512_4FMAPS;
+						if (EDX & (1U << 8)) type_ |= tAVX512_VP2INTERSECT;
+					}
+					// EAX=07H, ECX=1
+					getCpuidEx(7, 1, data);
+					if (type_ & tAVX512F) {
+						if (EAX & (1U << 5)) type_ |= tAVX512_BF16;
 					}
 				}
 			}
@@ -361,15 +471,21 @@ public:
 			if (EBX & (1U << 14)) type_ |= tMPX;
 			if (EBX & (1U << 29)) type_ |= tSHA;
 			if (ECX & (1U << 0)) type_ |= tPREFETCHWT1;
+			if (EDX & (1U << 24)) type_ |= tAMX_TILE;
+			if (EDX & (1U << 25)) type_ |= tAMX_INT8;
+			if (EDX & (1U << 22)) type_ |= tAMX_BF16;
 		}
 		setFamily();
+		setNumCores();
 		setCacheHierarchy();
 	}
 	void putFamily() const
 	{
+#ifndef XBYAK_ONLY_CLASS_CPU
 		printf("family=%d, model=%X, stepping=%d, extFamily=%d, extModel=%X\n",
 			family, model, stepping, extFamily, extModel);
 		printf("display:family=%X, model=%X\n", displayFamily, displayModel);
+#endif
 	}
 	bool has(Type type) const
 	{
@@ -377,16 +493,22 @@ public:
 	}
 };
 
+#ifndef XBYAK_ONLY_CLASS_CPU
 class Clock {
 public:
-	static inline uint64 getRdtsc()
+	static inline uint64_t getRdtsc()
 	{
-#ifdef _MSC_VER
+#ifdef XBYAK_INTEL_CPU_SPECIFIC
+	#ifdef _MSC_VER
 		return __rdtsc();
-#else
+	#else
 		unsigned int eax, edx;
 		__asm__ volatile("rdtsc" : "=a"(eax), "=d"(edx));
-		return ((uint64)edx << 32) | eax;
+		return ((uint64_t)edx << 32) | eax;
+	#endif
+#else
+		// TODO: Need another impl of Clock or rdtsc-equivalent for non-x86 cpu
+		return 0;
 #endif
 	}
 	Clock()
@@ -404,10 +526,10 @@ public:
 		count_++;
 	}
 	int getCount() const { return count_; }
-	uint64 getClock() const { return clock_; }
+	uint64_t getClock() const { return clock_; }
 	void clear() { count_ = 0; clock_ = 0; }
 private:
-	uint64 clock_;
+	uint64_t clock_;
 	int count_;
 };
 
@@ -457,7 +579,7 @@ public:
 	{
 		if (n_ == maxTblNum) {
 			fprintf(stderr, "ERR Pack::can't append\n");
-			throw Error(ERR_BAD_PARAMETER);
+			XBYAK_THROW_RET(ERR_BAD_PARAMETER, *this)
 		}
 		tbl_[n_++] = &t;
 		return *this;
@@ -466,7 +588,7 @@ public:
 	{
 		if (n > maxTblNum) {
 			fprintf(stderr, "ERR Pack::init bad n=%d\n", (int)n);
-			throw Error(ERR_BAD_PARAMETER);
+			XBYAK_THROW(ERR_BAD_PARAMETER)
 		}
 		n_ = n;
 		for (size_t i = 0; i < n; i++) {
@@ -477,7 +599,7 @@ public:
 	{
 		if (n >= n_) {
 			fprintf(stderr, "ERR Pack bad n=%d(%d)\n", (int)n, (int)n_);
-			throw Error(ERR_BAD_PARAMETER);
+			XBYAK_THROW_RET(ERR_BAD_PARAMETER, rax)
 		}
 		return *tbl_[n];
 	}
@@ -490,7 +612,7 @@ public:
 		if (num == size_t(-1)) num = n_ - pos;
 		if (pos + num > n_) {
 			fprintf(stderr, "ERR Pack::sub bad pos=%d, num=%d\n", (int)pos, (int)num);
-			throw Error(ERR_BAD_PARAMETER);
+			XBYAK_THROW_RET(ERR_BAD_PARAMETER, Pack())
 		}
 		Pack pack;
 		pack.n_ = num;
@@ -565,9 +687,9 @@ public:
 		, t(t_)
 	{
 		using namespace Xbyak;
-		if (pNum < 0 || pNum > 4) throw Error(ERR_BAD_PNUM);
+		if (pNum < 0 || pNum > 4) XBYAK_THROW(ERR_BAD_PNUM)
 		const int allRegNum = pNum + tNum_ + (useRcx_ ? 1 : 0) + (useRdx_ ? 1 : 0);
-		if (tNum_ < 0 || allRegNum > maxRegNum) throw Error(ERR_BAD_TNUM);
+		if (tNum_ < 0 || allRegNum > maxRegNum) XBYAK_THROW(ERR_BAD_TNUM)
 		const Reg64& _rsp = code->rsp;
 		saveNum_ = (std::max)(0, allRegNum - noSaveNum);
 		const int *tbl = getOrderTbl() + noSaveNum;
@@ -609,12 +731,7 @@ public:
 	~StackFrame()
 	{
 		if (!makeEpilog_) return;
-		try {
-			close();
-		} catch (std::exception& e) {
-			printf("ERR:StackFrame %s\n", e.what());
-			exit(1);
-		}
+		close();
 	}
 private:
 	const int *getOrderTbl() const
@@ -649,5 +766,137 @@ private:
 };
 #endif
 
+class Profiler {
+	int mode_;
+	const char *suffix_;
+	const void *startAddr_;
+#ifdef XBYAK_USE_PERF
+	FILE *fp_;
+#endif
+public:
+	enum {
+		None = 0,
+		Perf = 1,
+		VTune = 2
+	};
+	Profiler()
+		: mode_(None)
+		, suffix_("")
+		, startAddr_(0)
+#ifdef XBYAK_USE_PERF
+		, fp_(0)
+#endif
+	{
+	}
+	// append suffix to funcName
+	void setNameSuffix(const char *suffix)
+	{
+		suffix_ = suffix;
+	}
+	void setStartAddr(const void *startAddr)
+	{
+		startAddr_ = startAddr;
+	}
+	void init(int mode)
+	{
+		mode_ = None;
+		switch (mode) {
+		default:
+		case None:
+			return;
+		case Perf:
+#ifdef XBYAK_USE_PERF
+			close();
+			{
+				const int pid = getpid();
+				char name[128];
+				snprintf(name, sizeof(name), "/tmp/perf-%d.map", pid);
+				fp_ = fopen(name, "a+");
+				if (fp_ == 0) {
+					fprintf(stderr, "can't open %s\n", name);
+					return;
+				}
+			}
+			mode_ = Perf;
+#endif
+			return;
+		case VTune:
+#ifdef XBYAK_USE_VTUNE
+			dlopen("dummy", RTLD_LAZY); // force to load dlopen to enable jit profiling
+			if (iJIT_IsProfilingActive() != iJIT_SAMPLING_ON) {
+				fprintf(stderr, "VTune profiling is not active\n");
+				return;
+			}
+			mode_ = VTune;
+#endif
+			return;
+		}
+	}
+	~Profiler()
+	{
+		close();
+	}
+	void close()
+	{
+#ifdef XBYAK_USE_PERF
+		if (fp_ == 0) return;
+		fclose(fp_);
+		fp_ = 0;
+#endif
+	}
+	void set(const char *funcName, const void *startAddr, size_t funcSize) const
+	{
+		if (mode_ == None) return;
+#if !defined(XBYAK_USE_PERF) && !defined(XBYAK_USE_VTUNE)
+		(void)funcName;
+		(void)startAddr;
+		(void)funcSize;
+#endif
+#ifdef XBYAK_USE_PERF
+		if (mode_ == Perf) {
+			if (fp_ == 0) return;
+			fprintf(fp_, "%llx %zx %s%s", (long long)startAddr, funcSize, funcName, suffix_);
+			/*
+				perf does not recognize the function name which is less than 3,
+				so append '_' at the end of the name if necessary
+			*/
+			size_t n = strlen(funcName) + strlen(suffix_);
+			for (size_t i = n; i < 3; i++) {
+				fprintf(fp_, "_");
+			}
+			fprintf(fp_, "\n");
+			fflush(fp_);
+		}
+#endif
+#ifdef XBYAK_USE_VTUNE
+		if (mode_ != VTune) return;
+		char className[] = "";
+		char fileName[] = "";
+		iJIT_Method_Load jmethod = {};
+		jmethod.method_id = iJIT_GetNewMethodID();
+		jmethod.class_file_name = className;
+		jmethod.source_file_name = fileName;
+		jmethod.method_load_address = const_cast<void*>(startAddr);
+		jmethod.method_size = funcSize;
+		jmethod.line_number_size = 0;
+		char buf[128];
+		snprintf(buf, sizeof(buf), "%s%s", funcName, suffix_);
+		jmethod.method_name = buf;
+		iJIT_NotifyEvent(iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED, (void*)&jmethod);
+#endif
+	}
+	/*
+		for continuous set
+		funcSize = endAddr - <previous set endAddr>
+	*/
+	void set(const char *funcName, const void *endAddr)
+	{
+		set(funcName, startAddr_, (size_t)endAddr - (size_t)startAddr_);
+		startAddr_ = endAddr;
+	}
+};
+#endif // XBYAK_ONLY_CLASS_CPU
+
 } } // end of util
+
 #endif

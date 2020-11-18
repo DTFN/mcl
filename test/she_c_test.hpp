@@ -9,16 +9,17 @@ const size_t tryNum = 1024;
 
 CYBOZU_TEST_AUTO(init)
 {
-	int curve;
 #if MCLBN_FP_UNIT_SIZE == 4
-	curve = MCL_BN254;
-#elif MCLBN_FP_UNIT_SIZE == 6
-//	curve = MCL_BN381_1;
-	curve = MCL_BLS12_381;
+	int curve = MCL_BN254;
+#elif MCLBN_FP_UNIT_SIZE == 6 && MCLBN_FR_UNIT_SIZE == 4
+	int curve = MCL_BLS12_381;
+#elif MCLBN_FP_UNIT_SIZE == 6 && MCLBN_FR_UNIT_SIZE == 6
+	int curve = MCL_BN381_1;
 #elif MCLBN_FP_UNIT_SIZE == 8
-	curve = MCL_BN462;
+	int curve = MCL_BN462;
 #endif
 	int ret;
+	printf("curve=%d\n", curve);
 	ret = sheInit(curve, MCLBN_COMPILED_TIME_VAR);
 	CYBOZU_TEST_EQUAL(ret, 0);
 	ret = sheSetRangeForDLP(hashSize);
@@ -56,13 +57,39 @@ CYBOZU_TEST_AUTO(encDec)
 	CYBOZU_TEST_EQUAL(sheDecGT(&dec, &sec, &ct), 0);
 	CYBOZU_TEST_EQUAL(dec, m);
 
-	for (int m = -3; m < 3; m++) {
+	for (int m = -30; m < 30; m++) {
+		dec = 0;
 		sheEncG1(&c1, &pub, m);
+		CYBOZU_TEST_EQUAL(sheDecG1(&dec, &sec, &c1), 0);
+		CYBOZU_TEST_EQUAL(dec, m);
 		CYBOZU_TEST_EQUAL(sheIsZeroG1(&sec, &c1), m == 0);
+		dec = 0;
 		sheEncG2(&c2, &pub, m);
+		CYBOZU_TEST_EQUAL(sheDecG2(&dec, &sec, &c2), 0);
+		CYBOZU_TEST_EQUAL(dec, m);
 		CYBOZU_TEST_EQUAL(sheIsZeroG2(&sec, &c2), m == 0);
+		dec = 0;
 		sheEncGT(&ct, &pub, m);
+		CYBOZU_TEST_EQUAL(sheDecGT(&dec, &sec, &ct), 0);
+		CYBOZU_TEST_EQUAL(dec, m);
 		CYBOZU_TEST_EQUAL(sheIsZeroGT(&sec, &ct), m == 0);
+	}
+	for (int m = -30; m < 30; m++) {
+		dec = 0;
+		sheEncG1(&c1, &pub, 1);
+		sheMulG1(&c1, &c1, m);
+		CYBOZU_TEST_EQUAL(sheDecG1(&dec, &sec, &c1), 0);
+		CYBOZU_TEST_EQUAL(dec, m);
+		dec = 0;
+		sheEncG2(&c2, &pub, 1);
+		sheMulG2(&c2, &c2, m);
+		CYBOZU_TEST_EQUAL(sheDecG2(&dec, &sec, &c2), 0);
+		CYBOZU_TEST_EQUAL(dec, m);
+		dec = 0;
+		sheEncGT(&ct, &pub, 1);
+		sheMulGT(&ct, &ct, m);
+		CYBOZU_TEST_EQUAL(sheDecGT(&dec, &sec, &ct), 0);
+		CYBOZU_TEST_EQUAL(dec, m);
 	}
 }
 
@@ -430,6 +457,40 @@ CYBOZU_TEST_AUTO(ZkpEq)
 	ZkpEqTest(&sec, ppub, shePrecomputedPublicKeyEncWithZkpEq, shePrecomputedPublicKeyVerifyZkpEq);
 
 	shePrecomputedPublicKeyDestroy(ppub);
+}
+
+template<class CT, class ENC, class ENCV, class DEC, class SUB, class MUL>
+void IntVecTest(const sheSecretKey& sec, const shePublicKey& pub, const ENC& enc, const ENCV& encv, const DEC& dec, const SUB& sub, const MUL& mul, uint8_t *buf, size_t bufSize)
+{
+	CT c1, c2;
+	int ret;
+	ret = encv(&c1, &pub, buf, bufSize);
+	CYBOZU_TEST_EQUAL(ret, 0);
+	buf[0] += 5;
+	enc(&c2, &pub, 1);
+	ret = mul(&c2, &c2, buf, bufSize);
+	CYBOZU_TEST_EQUAL(ret, 0);
+	sub(&c2, &c2, &c1);
+	int64_t d;
+	ret = dec(&d, &sec, &c2);
+	CYBOZU_TEST_EQUAL(ret, 0);
+	CYBOZU_TEST_EQUAL(d, 5);
+}
+
+CYBOZU_TEST_AUTO(IntVec)
+{
+	sheSecretKey sec;
+	sheSecretKeySetByCSPRNG(&sec);
+	shePublicKey pub;
+	sheGetPublicKey(&pub, &sec);
+	uint8_t buf[48];
+	size_t n = 32;
+	for (size_t i = 0; i < sizeof(buf); i++) {
+		buf[i] = uint8_t(i + 5);
+	}
+	IntVecTest<sheCipherTextG1>(sec, pub, sheEncG1, sheEncIntVecG1, sheDecG1, sheSubG1, sheMulIntVecG1, buf, n);
+	IntVecTest<sheCipherTextG2>(sec, pub, sheEncG2, sheEncIntVecG2, sheDecG2, sheSubG2, sheMulIntVecG2, buf, n);
+	IntVecTest<sheCipherTextGT>(sec, pub, sheEncGT, sheEncIntVecGT, sheDecGT, sheSubGT, sheMulIntVecGT, buf, n);
 }
 
 CYBOZU_TEST_AUTO(finalExp)

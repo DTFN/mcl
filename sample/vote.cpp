@@ -10,15 +10,14 @@
 #include <fstream>
 #include <cybozu/random_generator.hpp>
 #include <cybozu/option.hpp>
-#include <cybozu/crypto.hpp>
 #include <cybozu/itoa.hpp>
 #include <mcl/fp.hpp>
 #include <mcl/ec.hpp>
 #include <mcl/elgamal.hpp>
 #include <mcl/ecparam.hpp>
 
-typedef mcl::FpT<> Fp;
-typedef mcl::FpT<mcl::ZnTag> Zn; // use ZnTag because Zn is different class with Fp
+typedef mcl::FpT<mcl::FpTag> Fp;
+typedef mcl::FpT<mcl::ZnTag> Zn;
 typedef mcl::EcT<Fp> Ec;
 typedef mcl::ElgamalT<Ec, Zn> Elgamal;
 
@@ -60,10 +59,7 @@ struct Param {
 
 void SysInit()
 {
-	const mcl::EcParam& para = mcl::ecparam::secp192k1;
-	Zn::init(para.n);
-	Fp::init(para.p);
-	Ec::init(para.a, para.b);
+	mcl::initCurve<Ec, Zn>(MCL_SECP192K1);
 }
 
 template<class T>
@@ -107,8 +103,7 @@ struct CipherWithZkp {
 	Elgamal::Zkp zkp;
 	bool verify(const Elgamal::PublicKey& pub) const
 	{
-		cybozu::crypto::Hash hash;
-		return pub.verify(c, zkp, hash);
+		return pub.verify(c, zkp);
 	}
 };
 
@@ -134,8 +129,7 @@ void Vote(const std::string& voteList)
 	puts("each voter votes");
 	for (size_t i = 0; i < voteList.size(); i++) {
 		CipherWithZkp c;
-		cybozu::crypto::Hash hash;
-		pub.encWithZkp(c.c, c.zkp, voteList[i] - '0', hash, rg);
+		pub.encWithZkp(c.c, c.zkp, voteList[i] - '0', rg);
 		const std::string sheetName = GetSheetName(idxTbl[i]);
 		printf("make %s\n", sheetName.c_str());
 		Save(sheetName, c);

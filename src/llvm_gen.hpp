@@ -46,16 +46,14 @@ struct File {
 template<size_t dummy=0>
 struct Param {
 	static File f;
+	static int llvmVer;
 };
 
 template<size_t dummy>
 File Param<dummy>::f;
 
-bool isOldLLVM = false;
-
 } // mcl::impl
 
-inline bool isOldLLVM() { return impl::isOldLLVM; }
 
 struct Generator {
 	static const uint8_t None = 0;
@@ -63,7 +61,14 @@ struct Generator {
 	static const uint8_t Imm = 2;
 	static const uint8_t Ptr = 1 << 7;
 	static const uint8_t IntPtr = Int | Ptr;
-	void setOldLLVM() { impl::isOldLLVM = true; }
+	int llvmVer;
+	void setOldLLVM() { llvmVer = 0x37; }
+	static const int V8 = 0x90;
+	bool isNewer(int ver) const
+	{
+		return llvmVer > ver;
+	}
+	void setLlvmVer(int ver) { llvmVer = ver; }
 	struct Type {
 		uint8_t type;
 		bool isPtr;
@@ -146,7 +151,7 @@ struct Generator {
 	Eval load(const Operand& p);
 	void store(const Operand& r, const Operand& p);
 	Eval select(const Operand& c, const Operand& r1, const Operand& r2);
-	Eval _alloca(uint32_t bit, uint32_t n);
+	Eval alloca_(uint32_t bit, uint32_t n);
 	// QQQ : type of type must be Type
 	Eval bitcast(const Operand& r, const Operand& type);
 	Eval icmp(CondType type, const Operand& r1, const Operand& r2);
@@ -474,9 +479,11 @@ inline Generator::Eval Generator::getelementptr(const Generator::Operand& p, con
 	Eval e;
 	e.op = p;
 	e.s = "getelementptr ";
-	if (!isOldLLVM()) {
-		e.s += "i" + cybozu::itoa(p.bit) + ", ";
+	const std::string bit = cybozu::itoa(p.bit);
+	if (isNewer(V8)) {
+		e.s += " inbounds " + bit + ", ";
 	}
+	e.s += "i" + bit + ", ";
 	e.s += p.toStr() + ", " + i.toStr();
 	return e;
 }
@@ -493,9 +500,11 @@ inline Generator::Eval Generator::load(const Generator::Operand& p)
 	e.op = p;
 	e.op.type.isPtr = false;
 	e.s = "load ";
-	if (!isOldLLVM()) {
-		e.s += "i" + cybozu::itoa(p.bit) + ", ";
+	const std::string bit = cybozu::itoa(p.bit);
+	if (isNewer(V8)) {
+		e.s += "i" + bit + ", ";
 	}
+	e.s += "i" + bit + ", ";
 	e.s += p.toStr();
 	return e;
 }
@@ -524,7 +533,7 @@ inline Generator::Eval Generator::select(const Generator::Operand& c, const Gene
 	return e;
 }
 
-inline Generator::Eval Generator::_alloca(uint32_t bit, uint32_t n)
+inline Generator::Eval Generator::alloca_(uint32_t bit, uint32_t n)
 {
 	Eval e;
 	e.op = Operand(IntPtr, bit);
